@@ -3,7 +3,7 @@ from fastapi.responses import Response, HTMLResponse
 from twilio.rest import Client
 from twilio.twiml.voice_response import VoiceResponse
 import anthropic
-from deepgram import DeepgramClient, PrerecordedOptions
+from deepgram import DeepgramClient, PrerecordedOptions, FileSource
 import httpx
 import sqlite3
 import json
@@ -383,8 +383,10 @@ async def recording_ready(request: Request):
             diarize=True
         )
         
-        response = deepgram_client.listen.prerecorded.v("1").transcribe_file(
-            {"buffer": audio_data},
+        payload = FileSource({"buffer": audio_data})
+        
+        response = deepgram_client.listen.rest.v("1").transcribe_file(
+            payload,
             options
         )
         
