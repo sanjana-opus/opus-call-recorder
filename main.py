@@ -3,13 +3,13 @@ from fastapi.responses import Response, HTMLResponse
 from twilio.rest import Client
 from twilio.twiml.voice_response import VoiceResponse
 import anthropic
-from deepgram import DeepgramClient, PrerecordedOptions, FileSource
 import httpx
 import sqlite3
 import json
 import os
 from datetime import datetime
 from contextlib import asynccontextmanager
+from deepgram import DeepgramClient, PrerecordedOptions
 
 # Initialize database
 def init_db():
@@ -39,18 +39,18 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-# Environment variables - YOU NEED TO ADD THESE IN RAILWAY
+# Environment variables
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "ACfa1aad34f3b4f8bb5f928c001e47ec65")
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")  # ADD THIS IN RAILWAY
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_PHONE_NUMBER = "+14694454221"
 YOUR_PHONE_NUMBER = "+12145188667"
 DEEPGRAM_API_KEY = "0426dca9f08f7c1d1621900e9f87cbd1c444f263"
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")  # ADD THIS IN RAILWAY
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 # Initialize clients
 twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-deepgram_client = DeepgramClient(DEEPGRAM_API_KEY)
+deepgram = DeepgramClient(DEEPGRAM_API_KEY)
 
 @app.get("/", response_class=HTMLResponse)
 async def home():
@@ -269,11 +269,9 @@ async def home():
                             <small>Call ID: ${data.call_sid}</small>
                         `;
                         
-                        // Clear form
                         document.getElementById('phone').value = '';
                         document.getElementById('practice_name').value = '';
                         
-                        // Reload history after 2 seconds
                         setTimeout(loadCallHistory, 2000);
                     } else {
                         throw new Error(data.detail || 'Failed to start call');
@@ -284,10 +282,7 @@ async def home():
                 }
             };
             
-            // Load call history on page load
             loadCallHistory();
-            
-            // Refresh call history every 30 seconds
             setInterval(loadCallHistory, 30000);
         </script>
     </body>
@@ -301,11 +296,9 @@ async def start_call(request: Request):
     caller_name = data.get("caller_name")
     practice_name = data.get("practice_name", "")
     
-    # Get the base URL from the request
     base_url = str(request.base_url).rstrip('/')
     
     try:
-        # Create the call
         call = twilio_client.calls.create(
             to=phone_number,
             from_=TWILIO_PHONE_NUMBER,
@@ -316,7 +309,6 @@ async def start_call(request: Request):
             recording_status_callback=f"{base_url}/recording-ready"
         )
         
-        # Save to database
         conn = sqlite3.connect('calls.db')
         c = conn.cursor()
         c.execute("""
@@ -333,7 +325,6 @@ async def start_call(request: Request):
 
 @app.post("/voice")
 async def voice():
-    """TwiML instructions to connect caller"""
     response = VoiceResponse()
     response.say("Connecting your call now.", voice='Polly.Joanna')
     response.dial(YOUR_PHONE_NUMBER)
@@ -341,7 +332,6 @@ async def voice():
 
 @app.post("/call-status")
 async def call_status(request: Request):
-    """Called when call status changes"""
     form = await request.form()
     call_sid = form.get("CallSid")
     status = form.get("CallStatus")
@@ -360,7 +350,6 @@ async def call_status(request: Request):
 
 @app.post("/recording-ready")
 async def recording_ready(request: Request):
-    """Called when recording is ready"""
     form = await request.form()
     recording_sid = form.get("RecordingSid")
     call_sid = form.get("CallSid")
@@ -374,23 +363,20 @@ async def recording_ready(request: Request):
         recording_response = await client.get(full_url, auth=auth)
         audio_data = recording_response.content
     
-    # Transcribe with Deepgram
+    # Transcribe with Deepgram - CORRECT v3 SDK usage
     try:
         options = PrerecordedOptions(
             model="nova-2",
             smart_format=True,
-            utterances=True,
-            diarize=True
         )
         
-        payload = FileSource({"buffer": audio_data})
-        
-        response = deepgram_client.listen.rest.v("1").transcribe_file(
-            payload,
+        # This is the correct way for Deepgram Python SDK v3
+        response = deepgram.listen.rest.v("1").transcribe_file(
+            {"buffer": audio_data, "mimetype": "audio/mp3"},
             options
         )
         
-        transcript = response.results.channels[0].alternatives[0].transcript
+        transcript = response["results"]["channels"][0]["alternatives"][0]["transcript"]
         
         # Analyze with Claude
         analysis = analyze_sales_call(transcript)
@@ -421,7 +407,6 @@ async def recording_ready(request: Request):
     return {"status": "processed"}
 
 def analyze_sales_call(transcript: str) -> dict:
-    """Use Claude to extract insights from sales call"""
     prompt = f"""Analyze this B2B sales call transcript for Opus Health (healthcare payments platform).
 
 Transcript:
@@ -453,7 +438,6 @@ Extract and return as JSON:
 
 @app.get("/calls/recent")
 async def recent_calls():
-    """Get recent calls"""
     conn = sqlite3.connect('calls.db')
     c = conn.cursor()
     c.execute("""
@@ -480,7 +464,6 @@ async def recent_calls():
 
 @app.get("/call/{call_sid}", response_class=HTMLResponse)
 async def view_call(call_sid: str):
-    """View full call details"""
     conn = sqlite3.connect('calls.db')
     c = conn.cursor()
     c.execute("""
