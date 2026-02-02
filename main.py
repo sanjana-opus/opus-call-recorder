@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Request, Form
 from fastapi.responses import Response, HTMLResponse
 from twilio.rest import Client
-from twilio.twiml.voice_response import VoiceResponse
+from twilio.twiml.voice_response import VoiceResponse, Dial
 import anthropic
 import httpx
 import sqlite3
@@ -177,11 +177,11 @@ async def home():
     <body>
         <div class="container">
             <h1>📞 Opus B2B Call Recorder</h1>
-            <p class="subtitle">Click to call → Auto-records → AI analyzes</p>
+            <p class="subtitle">Your phone rings first → Then connects to practice</p>
             
             <form id="callForm">
                 <div class="form-group">
-                    <label>Practice Phone Number</label>
+                    <label>Practice Phone Number (who you're calling)</label>
                     <input type="tel" id="phone" placeholder="+12145551234" required>
                 </div>
                 
@@ -247,7 +247,7 @@ async def home():
                 const statusDiv = document.getElementById('status');
                 statusDiv.style.display = 'block';
                 statusDiv.className = '';
-                statusDiv.innerHTML = '⏳ Initiating call...';
+                statusDiv.innerHTML = '⏳ Initiating call... YOUR phone will ring first!';
                 
                 try {
                     const response = await fetch('/start-call', {
@@ -265,7 +265,8 @@ async def home():
                     if (response.ok) {
                         statusDiv.className = 'status-success';
                         statusDiv.innerHTML = `
-                            ✅ Call initiated! Your phone will ring shortly.<br>
+                            ✅ YOUR phone (+1-214-518-8667) is ringing now!<br>
+                            Answer it, then you'll be connected to the practice.<br>
                             <small>Call ID: ${data.call_sid}</small>
                         `;
                         
@@ -292,17 +293,18 @@ async def home():
 @app.post("/start-call")
 async def start_call(request: Request):
     data = await request.json()
-    phone_number = data.get("phone_number")
+    practice_number = data.get("phone_number")  # The practice you're calling
     caller_name = data.get("caller_name")
     practice_name = data.get("practice_name", "")
     
     base_url = str(request.base_url).rstrip('/')
     
     try:
+        # FIXED: Call YOUR phone first, then connect to practice
         call = twilio_client.calls.create(
-            to=phone_number,
+            to=YOUR_PHONE_NUMBER,  # YOUR phone rings first!
             from_=TWILIO_PHONE_NUMBER,
-            url=f"{base_url}/voice",
+            url=f"{base_url}/voice?practice_number={practice_number}",  # Pass practice number as parameter
             status_callback=f"{base_url}/call-status",
             status_callback_event=['completed'],
             record=True,
@@ -314,7 +316,7 @@ async def start_call(request: Request):
         c.execute("""
             INSERT INTO sales_calls (call_sid, phone_number, caller_name, practice_name, status)
             VALUES (?, ?, ?, ?, 'initiated')
-        """, (call.sid, phone_number, caller_name, practice_name))
+        """, (call.sid, practice_number, caller_name, practice_name))
         conn.commit()
         conn.close()
         
@@ -324,10 +326,15 @@ async def start_call(request: Request):
         return {"error": str(e)}, 500
 
 @app.post("/voice")
-async def voice():
+async def voice(request: Request):
+    """TwiML instructions: You answer, then dial the practice"""
+    # Get the practice number from query params
+    practice_number = request.query_params.get('practice_number', '')
+    
     response = VoiceResponse()
-    response.say("Connecting your call now.", voice='Polly.Joanna')
-    response.dial(YOUR_PHONE_NUMBER)
+    response.say("Connecting you to the practice now.", voice='Polly.Joanna')
+    response.dial(practice_number)  # Dial the practice number
+    
     return Response(content=str(response), media_type="application/xml")
 
 @app.post("/call-status")
@@ -363,14 +370,13 @@ async def recording_ready(request: Request):
         recording_response = await client.get(full_url, auth=auth)
         audio_data = recording_response.content
     
-    # Transcribe with Deepgram - CORRECT v3 SDK usage
+    # Transcribe with Deepgram
     try:
         options = PrerecordedOptions(
             model="nova-2",
             smart_format=True,
         )
         
-        # This is the correct way for Deepgram Python SDK v3
         response = deepgram.listen.rest.v("1").transcribe_file(
             {"buffer": audio_data, "mimetype": "audio/mp3"},
             options
