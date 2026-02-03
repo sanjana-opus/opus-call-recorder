@@ -358,10 +358,16 @@ async def voice(request: Request):
     return Response(content=str(response), media_type="application/xml")
 
 @app.post("/call-status")
+@app.get("/call-status")
 async def call_status(request: Request):
-    form = await request.form()
-    call_sid = form.get("CallSid")
-    status = form.get("CallStatus")
+    # Handle both GET (query params) and POST (form data)
+    if request.method == "GET":
+        call_sid = request.query_params.get("CallSid")
+        status = request.query_params.get("CallStatus")
+    else:
+        form = await request.form()
+        call_sid = form.get("CallSid")
+        status = form.get("CallStatus")
     
     conn = sqlite3.connect('calls.db')
     c = conn.cursor()
@@ -376,22 +382,37 @@ async def call_status(request: Request):
     return {"status": "updated"}
 
 @app.post("/recording-ready")
+@app.get("/recording-ready")
 async def recording_ready(request: Request):
-    form = await request.form()
-    recording_sid = form.get("RecordingSid")
-    call_sid = form.get("CallSid")
-    recording_url = form.get("RecordingUrl")
+    # Handle both GET (query params) and POST (form data)
+    if request.method == "GET":
+        recording_sid = request.query_params.get("RecordingSid")
+        call_sid = request.query_params.get("CallSid")
+        recording_url = request.query_params.get("RecordingUrl")
+    else:
+        form = await request.form()
+        recording_sid = form.get("RecordingSid")
+        call_sid = form.get("CallSid")
+        recording_url = form.get("RecordingUrl")
+    
+    print(f"[RECORDING-READY] Call: {call_sid}, Recording: {recording_sid}")
     
     # Download recording
-    full_url = f"https://api.twilio.com{recording_url}.mp3"
+    full_url = f"https://api.twilio.com{recording_url}.mp3" if not recording_url.startswith("http") else recording_url + ".mp3"
+    
+    print(f"[RECORDING-READY] Downloading from: {full_url}")
     
     async with httpx.AsyncClient() as client:
         auth = (TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
         recording_response = await client.get(full_url, auth=auth)
         audio_data = recording_response.content
     
+    print(f"[RECORDING-READY] Downloaded {len(audio_data)} bytes")
+    
     # Transcribe with Deepgram
     try:
+        print("[RECORDING-READY] Starting Deepgram transcription...")
+        
         options = PrerecordedOptions(
             model="nova-2",
             smart_format=True,
@@ -404,8 +425,13 @@ async def recording_ready(request: Request):
         
         transcript = response["results"]["channels"][0]["alternatives"][0]["transcript"]
         
+        print(f"[RECORDING-READY] Transcript received: {len(transcript)} characters")
+        
         # Analyze with Claude
+        print("[RECORDING-READY] Starting Claude analysis...")
         analysis = analyze_sales_call(transcript)
+        
+        print("[RECORDING-READY] Analysis complete")
         
         # Update database
         conn = sqlite3.connect('calls.db')
@@ -418,8 +444,13 @@ async def recording_ready(request: Request):
         conn.commit()
         conn.close()
         
+        print(f"[RECORDING-READY] Database updated for call {call_sid}")
+        
     except Exception as e:
-        print(f"Error processing recording: {e}")
+        print(f"[RECORDING-READY ERROR] {str(e)}")
+        import traceback
+        traceback.print_exc()
+        
         conn = sqlite3.connect('calls.db')
         c = conn.cursor()
         c.execute("""
