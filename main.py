@@ -299,17 +299,27 @@ async def start_call(request: Request):
     
     base_url = str(request.base_url).rstrip('/')
     
+    # URL encode the practice number to ensure it passes correctly
+    from urllib.parse import quote
+    encoded_practice_number = quote(practice_number, safe='')
+    
+    print(f"[START-CALL] Practice number: {practice_number}")
+    print(f"[START-CALL] Encoded: {encoded_practice_number}")
+    print(f"[START-CALL] Calling user phone: {YOUR_PHONE_NUMBER}")
+    
     try:
         # FIXED: Call YOUR phone first, then connect to practice
         call = twilio_client.calls.create(
             to=YOUR_PHONE_NUMBER,  # YOUR phone rings first!
             from_=TWILIO_PHONE_NUMBER,
-            url=f"{base_url}/voice?practice_number={practice_number}",  # Pass practice number as parameter
+            url=f"{base_url}/voice?practice_number={encoded_practice_number}",  # Pass practice number as parameter
             status_callback=f"{base_url}/call-status",
             status_callback_event=['completed'],
             record=True,
             recording_status_callback=f"{base_url}/recording-ready"
         )
+        
+        print(f"[START-CALL] Call created: {call.sid}")
         
         conn = sqlite3.connect('calls.db')
         c = conn.cursor()
@@ -323,17 +333,27 @@ async def start_call(request: Request):
         return {"call_sid": call.sid, "status": "initiated"}
     
     except Exception as e:
+        print(f"[START-CALL ERROR] {str(e)}")
         return {"error": str(e)}, 500
 
 @app.post("/voice")
+@app.get("/voice")
 async def voice(request: Request):
     """TwiML instructions: You answer, then dial the practice"""
     # Get the practice number from query params
     practice_number = request.query_params.get('practice_number', '')
     
+    print(f"[VOICE] Practice number received: {practice_number}")
+    
     response = VoiceResponse()
-    response.say("Connecting you to the practice now.", voice='Polly.Joanna')
-    response.dial(practice_number)  # Dial the practice number
+    
+    if not practice_number:
+        response.say("Error: No practice number provided. Please try again.", voice='Polly.Joanna')
+        print("[VOICE ERROR] No practice number in query params")
+    else:
+        response.say("Connecting you to the practice now.", voice='Polly.Joanna')
+        response.dial(practice_number)
+        print(f"[VOICE] Dialing {practice_number}")
     
     return Response(content=str(response), media_type="application/xml")
 
