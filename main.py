@@ -43,7 +43,14 @@ app = FastAPI(lifespan=lifespan)
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "ACfa1aad34f3b4f8bb5f928c001e47ec65")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_PHONE_NUMBER = "+14694454221"
-YOUR_PHONE_NUMBER = "+12145188667"
+
+# User phone numbers - map caller names to their phones
+USER_PHONE_NUMBERS = {
+    "Sanjana": "+12145188667",
+    "Carolina": "+17865434900",
+    "Pranjal": "+12145188667"
+}
+
 DEEPGRAM_API_KEY = "0426dca9f08f7c1d1621900e9f87cbd1c444f263"
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
@@ -186,11 +193,11 @@ async def home():
                 </div>
                 
                 <div class="form-group">
-                    <label>Your Name</label>
+                    <label>Who's Calling?</label>
                     <select id="caller" required>
-                        <option value="Carolina">Carolina</option>
+                        <option value="Sanjana">Sanjana (+1-214-518-8667)</option>
+                        <option value="Carolina">Carolina (+1-786-543-4900)</option>
                         <option value="Pranjal">Pranjal</option>
-                        <option value="Sanjana">Sanjana</option>
                     </select>
                 </div>
                 
@@ -245,9 +252,16 @@ async def home():
                 e.preventDefault();
                 
                 const statusDiv = document.getElementById('status');
+                const caller = document.getElementById('caller').value;
+                const phoneNumbers = {
+                    'Sanjana': '+1-214-518-8667',
+                    'Carolina': '+1-786-543-4900',
+                    'Pranjal': '+1-214-518-8667'
+                };
+                
                 statusDiv.style.display = 'block';
                 statusDiv.className = '';
-                statusDiv.innerHTML = '⏳ Initiating call... YOUR phone will ring first!';
+                statusDiv.innerHTML = `⏳ Initiating call... ${caller}'s phone (${phoneNumbers[caller]}) will ring first!`;
                 
                 try {
                     const response = await fetch('/start-call', {
@@ -255,7 +269,7 @@ async def home():
                         headers: {'Content-Type': 'application/json'},
                         body: JSON.stringify({
                             phone_number: document.getElementById('phone').value,
-                            caller_name: document.getElementById('caller').value,
+                            caller_name: caller,
                             practice_name: document.getElementById('practice_name').value
                         })
                     });
@@ -265,7 +279,7 @@ async def home():
                     if (response.ok) {
                         statusDiv.className = 'status-success';
                         statusDiv.innerHTML = `
-                            ✅ YOUR phone (+1-214-518-8667) is ringing now!<br>
+                            ✅ ${caller}'s phone (${phoneNumbers[caller]}) is ringing now!<br>
                             Answer it, then you'll be connected to the practice.<br>
                             <small>Call ID: ${data.call_sid}</small>
                         `;
@@ -297,20 +311,23 @@ async def start_call(request: Request):
     caller_name = data.get("caller_name")
     practice_name = data.get("practice_name", "")
     
+    # Get the caller's phone number based on who's calling
+    user_phone = USER_PHONE_NUMBERS.get(caller_name, "+12145188667")  # Default to Sanjana
+    
     base_url = str(request.base_url).rstrip('/')
     
     # URL encode the practice number to ensure it passes correctly
     from urllib.parse import quote
     encoded_practice_number = quote(practice_number, safe='')
     
+    print(f"[START-CALL] Caller: {caller_name} ({user_phone})")
     print(f"[START-CALL] Practice number: {practice_number}")
     print(f"[START-CALL] Encoded: {encoded_practice_number}")
-    print(f"[START-CALL] Calling user phone: {YOUR_PHONE_NUMBER}")
     
     try:
-        # FIXED: Call YOUR phone first, then connect to practice
+        # Call the selected person's phone first, then connect to practice
         call = twilio_client.calls.create(
-            to=YOUR_PHONE_NUMBER,  # YOUR phone rings first!
+            to=user_phone,  # Call the selected person's phone!
             from_=TWILIO_PHONE_NUMBER,
             url=f"{base_url}/voice?practice_number={encoded_practice_number}",  # Pass practice number as parameter
             status_callback=f"{base_url}/call-status",
