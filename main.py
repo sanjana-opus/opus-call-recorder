@@ -435,8 +435,9 @@ async def recording_ready(request: Request):
         current_text = []
         
         for word_info in words:
-            speaker = word_info.get("speaker", 0)
-            word = word_info.get("word", "")
+            # Access as object attributes, not dict
+            speaker = getattr(word_info, 'speaker', 0)
+            word = getattr(word_info, 'word', '')
             
             if speaker != current_speaker:
                 if current_text:
@@ -575,6 +576,71 @@ async def recent_calls():
     
     conn.close()
     return calls
+
+@app.get("/admin/export-csv")
+async def export_csv():
+    """Export all calls data as CSV - includes transcripts and analysis"""
+    import csv
+    from io import StringIO
+    
+    conn = sqlite3.connect('calls.db')
+    c = conn.cursor()
+    c.execute("""
+        SELECT call_sid, phone_number, caller_name, practice_name, 
+               status, created_at, completed_at, transcript, analysis
+        FROM sales_calls
+        ORDER BY created_at DESC
+    """)
+    
+    output = StringIO()
+    writer = csv.writer(output)
+    
+    # Header
+    writer.writerow([
+        'Call ID', 'Phone Number', 'Caller', 'Practice Name', 
+        'Status', 'Created At', 'Completed At', 'Transcript',
+        'Practice Type', 'Pain Points', 'Objections', 
+        'Value Props Resonated', 'Next Steps', 'Conversion Likelihood',
+        'Key Quotes', 'Summary'
+    ])
+    
+    # Data
+    for row in c.fetchall():
+        call_sid, phone, caller, practice, status, created, completed, transcript, analysis_json = row
+        
+        # Parse analysis JSON
+        if analysis_json:
+            try:
+                analysis = json.loads(analysis_json)
+                practice_type = analysis.get('practice_type', '')
+                pain_points = '; '.join(analysis.get('pain_points', []))
+                objections = '; '.join(analysis.get('objections', []))
+                value_props = '; '.join(analysis.get('value_props_resonated', []))
+                next_steps = analysis.get('next_steps', '')
+                likelihood = analysis.get('conversion_likelihood', '')
+                quotes = '; '.join(analysis.get('key_quotes', []))
+                summary = analysis.get('summary', '')
+            except:
+                practice_type = pain_points = objections = value_props = next_steps = likelihood = quotes = summary = ''
+        else:
+            practice_type = pain_points = objections = value_props = next_steps = likelihood = quotes = summary = ''
+        
+        writer.writerow([
+            call_sid, phone, caller, practice, status, created, completed,
+            transcript or '', practice_type, pain_points, objections,
+            value_props, next_steps, likelihood, quotes, summary
+        ])
+    
+    conn.close()
+    
+    # Return CSV file
+    return Response(
+        content=output.getvalue(),
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": f"attachment; filename=opus_calls_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        }
+    )
 
 @app.get("/call/{call_sid}", response_class=HTMLResponse)
 async def view_call(call_sid: str):
