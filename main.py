@@ -11,6 +11,7 @@ from datetime import datetime
 from contextlib import asynccontextmanager
 from deepgram import DeepgramClient, PrerecordedOptions
 
+# Force Deploy Commit
 # Initialize database
 def init_db():
     conn = sqlite3.connect('calls.db')
