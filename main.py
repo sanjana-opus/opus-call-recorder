@@ -11,7 +11,6 @@ from datetime import datetime
 from contextlib import asynccontextmanager
 from deepgram import DeepgramClient, PrerecordedOptions
 
-# Force Deploy Commit
 # Initialize database
 def init_db():
     conn = sqlite3.connect('calls.db')
@@ -417,6 +416,9 @@ async def recording_ready(request: Request):
         options = PrerecordedOptions(
             model="nova-2",
             smart_format=True,
+            diarize=True,  # Enable speaker separation
+            punctuate=True,
+            paragraphs=True,
         )
         
         response = deepgram.listen.rest.v("1").transcribe_file(
@@ -424,13 +426,42 @@ async def recording_ready(request: Request):
             options
         )
         
-        transcript = response["results"]["channels"][0]["alternatives"][0]["transcript"]
+        # Get speaker-separated transcript
+        words = response["results"]["channels"][0]["alternatives"][0]["words"]
+        
+        # Format transcript with speaker labels
+        formatted_transcript = []
+        current_speaker = None
+        current_text = []
+        
+        for word_info in words:
+            speaker = word_info.get("speaker", 0)
+            word = word_info.get("word", "")
+            
+            if speaker != current_speaker:
+                if current_text:
+                    speaker_label = "You" if current_speaker == 0 else "Practice"
+                    formatted_transcript.append(f"\n**{speaker_label}:** {' '.join(current_text)}")
+                    current_text = []
+                current_speaker = speaker
+            
+            current_text.append(word)
+        
+        # Add the last speaker's text
+        if current_text:
+            speaker_label = "You" if current_speaker == 0 else "Practice"
+            formatted_transcript.append(f"\n**{speaker_label}:** {' '.join(current_text)}")
+        
+        transcript = "\n".join(formatted_transcript).strip()
+        
+        # Also get plain text for Claude analysis
+        plain_transcript = response["results"]["channels"][0]["alternatives"][0]["transcript"]
         
         print(f"[RECORDING-READY] Transcript received: {len(transcript)} characters")
         
-        # Analyze with Claude
+        # Analyze with Claude (use plain transcript for better analysis)
         print("[RECORDING-READY] Starting Claude analysis...")
-        analysis = analyze_sales_call(transcript)
+        analysis = analyze_sales_call(plain_transcript)  # Use plain text for analysis
         
         print("[RECORDING-READY] Analysis complete")
         
@@ -465,34 +496,59 @@ async def recording_ready(request: Request):
     return {"status": "processed"}
 
 def analyze_sales_call(transcript: str) -> dict:
-    prompt = f"""Analyze this B2B sales call transcript for Opus Health (healthcare payments platform).
+    prompt = f"""Analyze this B2B sales call transcript for Opus Health (a healthcare payments platform that helps practices with HSA/FSA billing).
+
+The call is between a sales representative from Opus Health and a dental/medical practice.
 
 Transcript:
 {transcript}
 
+Carefully extract the following information. If something is not mentioned or unclear, use "Not mentioned" or "Unknown" rather than making assumptions:
+
 Extract and return as JSON:
 {{
-    "practice_name": "extracted name or 'Unknown'",
-    "practice_type": "dental/weight loss/medical/other",
-    "pain_points": ["list of specific pain points mentioned"],
-    "objections": ["list of objections or concerns raised"],
-    "value_props_resonated": ["which value props seemed to interest them"],
-    "next_steps": "what was agreed upon for follow-up",
-    "conversion_likelihood": "high/medium/low/none",
-    "key_quotes": ["2-3 important quotes from the call"],
-    "summary": "2-3 sentence summary of the call"
-}}"""
+    "practice_name": "The actual name of the practice if mentioned, or 'Not mentioned'",
+    "practice_type": "dental/weight loss/medical/veterinary/other - determine from context",
+    "pain_points": ["Specific problems or frustrations the practice mentioned about their current payment/billing process. Be specific. If none mentioned, use empty array"],
+    "objections": ["Specific concerns, hesitations, or reasons for not moving forward that were explicitly stated. If none, use empty array"],
+    "value_props_resonated": ["Which benefits of Opus Health seemed to interest them based on their responses. Be specific. If none clear, use empty array"],
+    "next_steps": "Specific actions agreed upon (e.g., 'Send email with pricing', 'Schedule demo for next week', 'Call back in 2 days'). If none agreed, say 'No specific next steps agreed'",
+    "conversion_likelihood": "high/medium/low/none - high if they committed to next steps or showed strong interest, medium if interested but cautious, low if polite but not interested, none if rejected",
+    "key_quotes": ["1-3 notable things the practice representative said, word-for-word if possible. Focus on meaningful statements about their needs or interest level. If transcript is too short or unclear, use empty array"],
+    "summary": "2-3 sentence summary: What was discussed, how did the practice respond, and what's the outcome/status"
+}}
+
+Be specific and accurate. Only include information that is actually present in the transcript."""
     
     try:
         message = anthropic_client.messages.create(
             model="claude-sonnet-4-20250514",
-            max_tokens=1500,
+            max_tokens=2000,
             messages=[{"role": "user", "content": prompt}]
         )
         
-        return json.loads(message.content[0].text)
-    except:
-        return {"error": "Analysis failed"}
+        # Extract JSON from response
+        response_text = message.content[0].text
+        # Try to find JSON in the response
+        import re
+        json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+        if json_match:
+            return json.loads(json_match.group())
+        else:
+            return json.loads(response_text)
+    except Exception as e:
+        print(f"[ANALYSIS ERROR] {str(e)}")
+        return {
+            "practice_name": "Analysis error",
+            "practice_type": "Unknown",
+            "pain_points": [],
+            "objections": [],
+            "value_props_resonated": [],
+            "next_steps": "Analysis failed",
+            "conversion_likelihood": "unknown",
+            "key_quotes": [],
+            "summary": f"Error analyzing call: {str(e)}"
+        }
 
 @app.get("/calls/recent")
 async def recent_calls():
