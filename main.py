@@ -1,40 +1,282 @@
-from fastapi import FastAPI, Request, Form
+from fastapi import FastAPI, Request
 from fastapi.responses import Response, HTMLResponse
 from twilio.rest import Client
-from twilio.twiml.voice_response import VoiceResponse, Dial
-import anthropic
+from twilio.twiml.voice_response import VoiceResponse
+import asyncio
 import httpx
-import sqlite3
 import json
 import os
 from datetime import datetime
 from contextlib import asynccontextmanager
+from io import StringIO
+import csv
+from typing import Any
 from deepgram import DeepgramClient, PrerecordedOptions
+from openai import OpenAI
+from supabase import create_client, Client as SupabaseClient
+from hubspot import HubSpot
+from hubspot.crm.contacts import (
+    PublicObjectSearchRequest,
+    SimplePublicObjectInput,
+)
 
-# Initialize database
-def init_db():
-    conn = sqlite3.connect('calls.db')
-    c = conn.cursor()
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS sales_calls (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            call_sid TEXT UNIQUE,
-            phone_number TEXT,
-            caller_name TEXT,
-            practice_name TEXT,
-            status TEXT,
-            transcript TEXT,
-            analysis TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            completed_at TIMESTAMP
+SUPABASE_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS sales_calls (
+    id SERIAL PRIMARY KEY,
+    call_sid TEXT UNIQUE NOT NULL,
+    phone_number TEXT,
+    caller_name TEXT,
+    practice_name TEXT,
+    status TEXT,
+    transcript TEXT,
+    analysis JSONB,
+    recording_url TEXT,
+    created_at TIMESTAMP DEFAULT NOW(),
+    completed_at TIMESTAMP
+);
+"""
+
+
+def _safe_json_parse(value: Any) -> dict:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
+def get_supabase() -> SupabaseClient | None:
+    global supabase
+    if supabase is None and SUPABASE_URL and SUPABASE_KEY:
+        try:
+            supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+            print("[SUPABASE] Client initialized")
+        except Exception as exc:
+            print(f"[SUPABASE ERROR] Failed to initialize client: {exc}")
+            supabase = None
+    return supabase
+
+
+def _run_sync(func, *args, **kwargs):
+    return asyncio.to_thread(func, *args, **kwargs)
+
+
+async def init_db():
+    client = get_supabase()
+    if not client:
+        print("[SUPABASE] Missing SUPABASE_URL or SUPABASE_KEY. DB features disabled.")
+        return
+    try:
+        await _run_sync(client.table("sales_calls").select("id").limit(1).execute)
+        print("[SUPABASE] Connection test passed")
+    except Exception as exc:
+        print(f"[SUPABASE ERROR] Connection test failed: {exc}")
+        print(f"[SUPABASE] Ensure table exists using SQL:\n{SUPABASE_SCHEMA_SQL}")
+
+
+async def db_insert_call(call_sid: str, phone_number: str, caller_name: str, practice_name: str):
+    client = get_supabase()
+    if not client:
+        return
+    payload = {
+        "call_sid": call_sid,
+        "phone_number": phone_number,
+        "caller_name": caller_name,
+        "practice_name": practice_name,
+        "status": "initiated",
+    }
+    try:
+        await _run_sync(client.table("sales_calls").insert(payload).execute)
+    except Exception as exc:
+        print(f"[SUPABASE ERROR] Insert call failed: {exc}")
+
+
+async def db_update_call_status(call_sid: str, status: str):
+    client = get_supabase()
+    if not client:
+        return
+    try:
+        await _run_sync(client.table("sales_calls").update({"status": status}).eq("call_sid", call_sid).execute)
+    except Exception as exc:
+        print(f"[SUPABASE ERROR] Update call status failed: {exc}")
+
+
+async def db_complete_call(call_sid: str, transcript: str, analysis: dict, recording_url: str | None):
+    client = get_supabase()
+    if not client:
+        return
+    payload = {
+        "transcript": transcript,
+        "analysis": analysis,
+        "recording_url": recording_url,
+        "status": "completed",
+        "completed_at": datetime.now().isoformat(),
+    }
+    try:
+        await _run_sync(client.table("sales_calls").update(payload).eq("call_sid", call_sid).execute)
+    except Exception as exc:
+        print(f"[SUPABASE ERROR] Complete call update failed: {exc}")
+
+
+async def db_set_error(call_sid: str):
+    await db_update_call_status(call_sid, "error")
+
+
+async def db_recent_calls(limit: int = 10):
+    client = get_supabase()
+    if not client:
+        return []
+    try:
+        resp = await _run_sync(client.table("sales_calls").select("call_sid,phone_number,caller_name,practice_name,status,created_at,transcript").order("created_at", desc=True).limit(limit).execute)
+        return resp.data or []
+    except Exception as exc:
+        print(f"[SUPABASE ERROR] Fetch recent calls failed: {exc}")
+        return []
+
+
+async def db_export_calls():
+    client = get_supabase()
+    if not client:
+        return []
+    try:
+        resp = await _run_sync(client.table("sales_calls").select("call_sid,phone_number,caller_name,practice_name,status,created_at,completed_at,transcript,analysis,recording_url").order("created_at", desc=True).execute)
+        return resp.data or []
+    except Exception as exc:
+        print(f"[SUPABASE ERROR] Export calls query failed: {exc}")
+        return []
+
+
+async def db_get_call(call_sid: str):
+    client = get_supabase()
+    if not client:
+        return None
+    try:
+        resp = await _run_sync(client.table("sales_calls").select("phone_number,caller_name,practice_name,transcript,analysis,created_at").eq("call_sid", call_sid).limit(1).execute)
+        return (resp.data or [None])[0]
+    except Exception as exc:
+        print(f"[SUPABASE ERROR] Fetch call failed: {exc}")
+        return None
+
+
+def _map_deal_stage(conversion_likelihood: str) -> str:
+    mapping = {
+        "high": HUBSPOT_STAGE_HIGH,
+        "medium": HUBSPOT_STAGE_MEDIUM,
+        "low": HUBSPOT_STAGE_LOW,
+        "none": HUBSPOT_STAGE_NONE,
+    }
+    return mapping.get((conversion_likelihood or "").lower(), HUBSPOT_STAGE_NONE)
+
+
+def create_or_update_hubspot_contact(phone_number: str, caller_name: str, practice_name: str, analysis: dict, recording_url: str | None) -> str | None:
+    if not hubspot_client:
+        print("[HUBSPOT] HUBSPOT_API_KEY not set. Skipping contact sync.")
+        return None
+    print(f"[HUBSPOT] Upserting contact for phone={phone_number}")
+    props = {
+        "phone": phone_number,
+        "firstname": caller_name or "Unknown",
+        "company": practice_name or analysis.get("practice_name", "Unknown"),
+        "practice_type": analysis.get("practice_type", "Unknown"),
+        "conversion_likelihood": analysis.get("conversion_likelihood", "unknown"),
+        "pain_points": ", ".join(analysis.get("pain_points", [])),
+        "objections": ", ".join(analysis.get("objections", [])),
+        "value_props_resonated": ", ".join(analysis.get("value_props_resonated", [])),
+        "next_steps": analysis.get("next_steps", ""),
+        "last_call_date": datetime.utcnow().isoformat(),
+        "called_by": caller_name or "",
+        "call_recording_url": recording_url or "",
+    }
+    try:
+        search = PublicObjectSearchRequest(
+            filter_groups=[{"filters": [{"propertyName": "phone", "operator": "EQ", "value": phone_number}]}],
+            properties=["phone"],
+            limit=1,
         )
-    ''')
-    conn.commit()
-    conn.close()
+        result = hubspot_client.crm.contacts.search_api.do_search(public_object_search_request=search)
+        if result.results:
+            contact_id = result.results[0].id
+            hubspot_client.crm.contacts.basic_api.update(contact_id, simple_public_object_input=SimplePublicObjectInput(properties=props))
+            print(f"[HUBSPOT] Updated contact {contact_id}")
+            return contact_id
+
+        created = hubspot_client.crm.contacts.basic_api.create(simple_public_object_input=SimplePublicObjectInput(properties=props))
+        print(f"[HUBSPOT] Created contact {created.id}")
+        return created.id
+    except Exception as exc:
+        print(f"[HUBSPOT ERROR] create_or_update_hubspot_contact failed: {exc}")
+        return None
+
+
+def add_contact_to_sales_pipeline(contact_id: str, phone_number: str, analysis: dict):
+    if not hubspot_client or not contact_id:
+        return
+    stage = _map_deal_stage(analysis.get("conversion_likelihood", "none"))
+    print(f"[HUBSPOT] Creating deal for contact={contact_id} stage={stage}")
+    try:
+        deal_props = {
+            "dealname": f"Sales Lead - {phone_number}",
+            "pipeline": HUBSPOT_PIPELINE_ID,
+            "dealstage": stage,
+        }
+        deal = hubspot_client.crm.deals.basic_api.create(simple_public_object_input=SimplePublicObjectInput(properties=deal_props))
+        assoc_spec = [{"associationCategory": "HUBSPOT_DEFINED", "associationTypeId": 3}]
+        hubspot_client.crm.associations.v4.basic_api.create("contacts", contact_id, "deals", deal.id, association_spec=assoc_spec)
+        print(f"[HUBSPOT] Deal {deal.id} created and associated")
+    except Exception as exc:
+        print(f"[HUBSPOT ERROR] add_contact_to_sales_pipeline failed: {exc}")
+
+
+def add_hubspot_note(contact_id: str, transcript: str, analysis: dict, recording_url: str | None):
+    if not hubspot_client or not contact_id:
+        return
+    note_body = f"""Call summary: {analysis.get('summary', '')}
+Practice type: {analysis.get('practice_type', 'Unknown')}
+Pain points: {', '.join(analysis.get('pain_points', []))}
+Objections: {', '.join(analysis.get('objections', []))}
+Next steps: {analysis.get('next_steps', '')}
+Recording: {recording_url or 'N/A'}
+Transcript: {transcript[:3000]}"""
+    print(f"[HUBSPOT] Adding note for contact={contact_id}")
+    try:
+        note = hubspot_client.crm.objects.notes.basic_api.create(
+            simple_public_object_input=SimplePublicObjectInput(properties={
+                "hs_timestamp": datetime.utcnow().isoformat(),
+                "hs_note_body": note_body,
+            })
+        )
+        assoc_spec = [{"associationCategory": "HUBSPOT_DEFINED", "associationTypeId": 202}]
+        hubspot_client.crm.associations.v4.basic_api.create("notes", note.id, "contacts", contact_id, association_spec=assoc_spec)
+        print(f"[HUBSPOT] Note {note.id} created")
+    except Exception as exc:
+        print(f"[HUBSPOT ERROR] add_hubspot_note failed: {exc}")
+
+
+async def sync_hubspot(call_payload: dict, transcript: str, analysis: dict):
+    if not HUBSPOT_API_KEY:
+        print("[HUBSPOT] API key not configured, skipping sync")
+        return
+    try:
+        contact_id = await _run_sync(
+            create_or_update_hubspot_contact,
+            call_payload.get("phone_number", ""),
+            call_payload.get("caller_name", ""),
+            call_payload.get("practice_name", ""),
+            analysis,
+            call_payload.get("recording_url"),
+        )
+        if contact_id:
+            await _run_sync(add_contact_to_sales_pipeline, contact_id, call_payload.get("phone_number", ""), analysis)
+            await _run_sync(add_hubspot_note, contact_id, transcript, analysis, call_payload.get("recording_url"))
+    except Exception as exc:
+        print(f"[HUBSPOT ERROR] sync_hubspot failed: {exc}")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    init_db()
+    await init_db()
     yield
 
 app = FastAPI(lifespan=lifespan)
@@ -51,12 +293,23 @@ USER_PHONE_NUMBERS = {
     "Pranjal": "+12145188667"
 }
 
-DEEPGRAM_API_KEY = "0426dca9f08f7c1d1621900e9f87cbd1c444f263"
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "0426dca9f08f7c1d1621900e9f87cbd1c444f263")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+HUBSPOT_API_KEY = os.getenv("HUBSPOT_API_KEY")
+HUBSPOT_PIPELINE_ID = os.getenv("HUBSPOT_PIPELINE_ID", "default")
+HUBSPOT_STAGE_HIGH = os.getenv("HUBSPOT_STAGE_HIGH", "appointment_scheduled")
+HUBSPOT_STAGE_MEDIUM = os.getenv("HUBSPOT_STAGE_MEDIUM", "qualified_to_buy")
+HUBSPOT_STAGE_LOW = os.getenv("HUBSPOT_STAGE_LOW", "presentation_scheduled")
+HUBSPOT_STAGE_NONE = os.getenv("HUBSPOT_STAGE_NONE", "lead_status_open")
+
+supabase: SupabaseClient | None = None
+openai_client: OpenAI | None = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+hubspot_client: HubSpot | None = HubSpot(access_token=HUBSPOT_API_KEY) if HUBSPOT_API_KEY else None
 
 # Initialize clients
 twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 deepgram = DeepgramClient(DEEPGRAM_API_KEY)
 
 @app.get("/", response_class=HTMLResponse)
@@ -338,15 +591,7 @@ async def start_call(request: Request):
         
         print(f"[START-CALL] Call created: {call.sid}")
         
-        conn = sqlite3.connect('calls.db')
-        c = conn.cursor()
-        c.execute("""
-            INSERT INTO sales_calls (call_sid, phone_number, caller_name, practice_name, status)
-            VALUES (?, ?, ?, ?, 'initiated')
-        """, (call.sid, practice_number, caller_name, practice_name))
-        conn.commit()
-        conn.close()
-        
+        await db_insert_call(call.sid, practice_number, caller_name, practice_name)
         return {"call_sid": call.sid, "status": "initiated"}
     
     except Exception as e:
@@ -386,22 +631,12 @@ async def call_status(request: Request):
         call_sid = form.get("CallSid")
         status = form.get("CallStatus")
     
-    conn = sqlite3.connect('calls.db')
-    c = conn.cursor()
-    c.execute("""
-        UPDATE sales_calls 
-        SET status = ?
-        WHERE call_sid = ?
-    """, (status, call_sid))
-    conn.commit()
-    conn.close()
-    
+    await db_update_call_status(call_sid, status)
     return {"status": "updated"}
 
 @app.post("/recording-ready")
 @app.get("/recording-ready")
 async def recording_ready(request: Request):
-    # Handle both GET (query params) and POST (form data)
     if request.method == "GET":
         recording_sid = request.query_params.get("RecordingSid")
         call_sid = request.query_params.get("CallSid")
@@ -411,107 +646,58 @@ async def recording_ready(request: Request):
         recording_sid = form.get("RecordingSid")
         call_sid = form.get("CallSid")
         recording_url = form.get("RecordingUrl")
-    
+
     print(f"[RECORDING-READY] Call: {call_sid}, Recording: {recording_sid}")
-    
-    # Download recording
-    full_url = f"https://api.twilio.com{recording_url}.mp3" if not recording_url.startswith("http") else recording_url + ".mp3"
-    
-    print(f"[RECORDING-READY] Downloading from: {full_url}")
-    
-    async with httpx.AsyncClient() as client:
-        auth = (TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-        recording_response = await client.get(full_url, auth=auth)
-        audio_data = recording_response.content
-    
-    print(f"[RECORDING-READY] Downloaded {len(audio_data)} bytes")
-    
-    # Transcribe with Deepgram
+    full_url = f"https://api.twilio.com{recording_url}.mp3" if recording_url and not recording_url.startswith("http") else f"{recording_url}.mp3"
+
     try:
-        print("[RECORDING-READY] Starting Deepgram transcription...")
-        
+        async with httpx.AsyncClient() as client:
+            auth = (TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+            recording_response = await client.get(full_url, auth=auth)
+            recording_response.raise_for_status()
+            audio_data = recording_response.content
+
+        print(f"[RECORDING-READY] Downloaded {len(audio_data)} bytes")
         options = PrerecordedOptions(
             model="nova-2",
             smart_format=True,
-            diarize=True,  # Enable speaker separation
+            diarize=True,
             punctuate=True,
-            paragraphs=True,
+            utterances=True,
         )
-        
         response = deepgram.listen.rest.v("1").transcribe_file(
             {"buffer": audio_data, "mimetype": "audio/mp3"},
-            options
+            options,
         )
-        
-        # Get speaker-separated transcript
-        words = response["results"]["channels"][0]["alternatives"][0]["words"]
-        
-        # Format transcript with speaker labels
-        formatted_transcript = []
-        current_speaker = None
-        current_text = []
-        
-        for word_info in words:
-            # Access as object attributes, not dict
-            speaker = getattr(word_info, 'speaker', 0)
-            word = getattr(word_info, 'word', '')
-            
-            if speaker != current_speaker:
-                if current_text:
-                    speaker_label = "You" if current_speaker == 0 else "Practice"
-                    formatted_transcript.append(f"\n**{speaker_label}:** {' '.join(current_text)}")
-                    current_text = []
-                current_speaker = speaker
-            
-            current_text.append(word)
-        
-        # Add the last speaker's text
-        if current_text:
-            speaker_label = "You" if current_speaker == 0 else "Practice"
-            formatted_transcript.append(f"\n**{speaker_label}:** {' '.join(current_text)}")
-        
-        transcript = "\n".join(formatted_transcript).strip()
-        
-        # Also get plain text for Claude analysis
+
         plain_transcript = response["results"]["channels"][0]["alternatives"][0]["transcript"]
-        
-        print(f"[RECORDING-READY] Transcript received: {len(transcript)} characters")
-        
-        # Analyze with Claude (use plain transcript for better analysis)
-        print("[RECORDING-READY] Starting Claude analysis...")
-        analysis = analyze_sales_call(plain_transcript)  # Use plain text for analysis
-        
-        print("[RECORDING-READY] Analysis complete")
-        
-        # Update database
-        conn = sqlite3.connect('calls.db')
-        c = conn.cursor()
-        c.execute("""
-            UPDATE sales_calls 
-            SET transcript = ?, analysis = ?, status = 'completed', completed_at = ?
-            WHERE call_sid = ?
-        """, (transcript, json.dumps(analysis), datetime.now().isoformat(), call_sid))
-        conn.commit()
-        conn.close()
-        
+        utterances = response.get("results", {}).get("utterances", [])
+        if utterances:
+            print("[RECORDING-READY] Using Deepgram utterances diarization")
+            lines = []
+            for utt in utterances:
+                speaker_num = utt.get("speaker", 0)
+                text = utt.get("transcript", "")
+                speaker_label = "You" if speaker_num == 0 else "Practice"
+                lines.append(f"**{speaker_label}:** {text}")
+            transcript = "\n\n".join(lines)
+        else:
+            print("[RECORDING-READY] Utterances unavailable, falling back to plain transcript")
+            transcript = plain_transcript
+
+        analysis = analyze_sales_call(plain_transcript)
+        await db_complete_call(call_sid, transcript, analysis, recording_url)
         print(f"[RECORDING-READY] Database updated for call {call_sid}")
-        
+
+        call_payload = await db_get_call(call_sid) or {}
+        call_payload["recording_url"] = recording_url
+        await sync_hubspot(call_payload, transcript, analysis)
     except Exception as e:
         print(f"[RECORDING-READY ERROR] {str(e)}")
-        import traceback
-        traceback.print_exc()
-        
-        conn = sqlite3.connect('calls.db')
-        c = conn.cursor()
-        c.execute("""
-            UPDATE sales_calls 
-            SET status = 'error'
-            WHERE call_sid = ?
-        """, (call_sid,))
-        conn.commit()
-        conn.close()
-    
+        await db_set_error(call_sid)
+
     return {"status": "processed"}
+
 
 def analyze_sales_call(transcript: str) -> dict:
     prompt = f"""Analyze this B2B sales call transcript for Opus Health (a healthcare payments platform that helps practices with HSA/FSA billing).
@@ -537,120 +723,90 @@ Extract and return as JSON:
 }}
 
 Be specific and accurate. Only include information that is actually present in the transcript."""
-    
+
+    fallback = {
+        "practice_name": "Analysis error",
+        "practice_type": "Unknown",
+        "pain_points": [],
+        "objections": [],
+        "value_props_resonated": [],
+        "next_steps": "Analysis failed",
+        "conversion_likelihood": "unknown",
+        "key_quotes": [],
+        "summary": "Error analyzing call",
+    }
+    if not openai_client:
+        fallback["summary"] = "OPENAI_API_KEY missing"
+        return fallback
+
     try:
-        message = anthropic_client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=2000,
-            messages=[{"role": "user", "content": prompt}]
+        resp = openai_client.chat.completions.create(
+            model="gpt-4-turbo-preview",
+            response_format={"type": "json_object"},
+            messages=[{"role": "user", "content": prompt}],
         )
-        
-        # Extract JSON from response
-        response_text = message.content[0].text
-        # Try to find JSON in the response
-        import re
-        json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
-        if json_match:
-            return json.loads(json_match.group())
-        else:
-            return json.loads(response_text)
+        content = resp.choices[0].message.content
+        return json.loads(content)
     except Exception as e:
         print(f"[ANALYSIS ERROR] {str(e)}")
-        return {
-            "practice_name": "Analysis error",
-            "practice_type": "Unknown",
-            "pain_points": [],
-            "objections": [],
-            "value_props_resonated": [],
-            "next_steps": "Analysis failed",
-            "conversion_likelihood": "unknown",
-            "key_quotes": [],
-            "summary": f"Error analyzing call: {str(e)}"
-        }
+        fallback["summary"] = f"Error analyzing call: {str(e)}"
+        return fallback
+
 
 @app.get("/calls/recent")
 async def recent_calls():
-    conn = sqlite3.connect('calls.db')
-    c = conn.cursor()
-    c.execute("""
-        SELECT call_sid, phone_number, caller_name, practice_name, status, created_at, transcript
-        FROM sales_calls
-        ORDER BY created_at DESC
-        LIMIT 10
-    """)
-    
+    rows = await db_recent_calls(limit=10)
     calls = []
-    for row in c.fetchall():
+    for row in rows:
         calls.append({
-            "call_sid": row[0],
-            "phone_number": row[1],
-            "caller_name": row[2],
-            "practice_name": row[3],
-            "status": row[4],
-            "created_at": row[5],
-            "transcript": row[6] is not None
+            "call_sid": row.get("call_sid"),
+            "phone_number": row.get("phone_number"),
+            "caller_name": row.get("caller_name"),
+            "practice_name": row.get("practice_name"),
+            "status": row.get("status"),
+            "created_at": row.get("created_at"),
+            "transcript": bool(row.get("transcript")),
         })
-    
-    conn.close()
     return calls
+
 
 @app.get("/admin/export-csv")
 async def export_csv():
     """Export all calls data as CSV - includes transcripts and analysis"""
-    import csv
-    from io import StringIO
-    
-    conn = sqlite3.connect('calls.db')
-    c = conn.cursor()
-    c.execute("""
-        SELECT call_sid, phone_number, caller_name, practice_name, 
-               status, created_at, completed_at, transcript, analysis
-        FROM sales_calls
-        ORDER BY created_at DESC
-    """)
-    
+    rows = await db_export_calls()
+
     output = StringIO()
     writer = csv.writer(output)
-    
-    # Header
     writer.writerow([
-        'Call ID', 'Phone Number', 'Caller', 'Practice Name', 
+        'Call ID', 'Phone Number', 'Caller', 'Practice Name',
         'Status', 'Created At', 'Completed At', 'Transcript',
-        'Practice Type', 'Pain Points', 'Objections', 
+        'Practice Type', 'Pain Points', 'Objections',
         'Value Props Resonated', 'Next Steps', 'Conversion Likelihood',
-        'Key Quotes', 'Summary'
+        'Key Quotes', 'Summary', 'Recording URL'
     ])
-    
-    # Data
-    for row in c.fetchall():
-        call_sid, phone, caller, practice, status, created, completed, transcript, analysis_json = row
-        
-        # Parse analysis JSON
-        if analysis_json:
-            try:
-                analysis = json.loads(analysis_json)
-                practice_type = analysis.get('practice_type', '')
-                pain_points = '; '.join(analysis.get('pain_points', []))
-                objections = '; '.join(analysis.get('objections', []))
-                value_props = '; '.join(analysis.get('value_props_resonated', []))
-                next_steps = analysis.get('next_steps', '')
-                likelihood = analysis.get('conversion_likelihood', '')
-                quotes = '; '.join(analysis.get('key_quotes', []))
-                summary = analysis.get('summary', '')
-            except:
-                practice_type = pain_points = objections = value_props = next_steps = likelihood = quotes = summary = ''
-        else:
-            practice_type = pain_points = objections = value_props = next_steps = likelihood = quotes = summary = ''
-        
+
+    for row in rows:
+        analysis = _safe_json_parse(row.get("analysis"))
         writer.writerow([
-            call_sid, phone, caller, practice, status, created, completed,
-            transcript or '', practice_type, pain_points, objections,
-            value_props, next_steps, likelihood, quotes, summary
+            row.get("call_sid", ""),
+            row.get("phone_number", ""),
+            row.get("caller_name", ""),
+            row.get("practice_name", ""),
+            row.get("status", ""),
+            row.get("created_at", ""),
+            row.get("completed_at", ""),
+            row.get("transcript", ""),
+            analysis.get('practice_type', ''),
+            '; '.join(analysis.get('pain_points', [])),
+            '; '.join(analysis.get('objections', [])),
+            '; '.join(analysis.get('value_props_resonated', [])),
+            analysis.get('next_steps', ''),
+            analysis.get('conversion_likelihood', ''),
+            '; '.join(analysis.get('key_quotes', [])),
+            analysis.get('summary', ''),
+            row.get('recording_url', ''),
         ])
-    
-    conn.close()
-    
-    # Return CSV file
+
     return Response(
         content=output.getvalue(),
         media_type="text/csv",
@@ -659,24 +815,19 @@ async def export_csv():
         }
     )
 
+
 @app.get("/call/{call_sid}", response_class=HTMLResponse)
 async def view_call(call_sid: str):
-    conn = sqlite3.connect('calls.db')
-    c = conn.cursor()
-    c.execute("""
-        SELECT phone_number, caller_name, practice_name, transcript, analysis, created_at
-        FROM sales_calls
-        WHERE call_sid = ?
-    """, (call_sid,))
-    
-    row = c.fetchone()
-    conn.close()
-    
+    row = await db_get_call(call_sid)
     if not row:
         return "<h1>Call not found</h1>"
-    
-    phone, caller, practice, transcript, analysis_json, created = row
-    analysis = json.loads(analysis_json) if analysis_json else {}
+
+    phone = row.get("phone_number")
+    caller = row.get("caller_name")
+    practice = row.get("practice_name")
+    transcript = row.get("transcript")
+    analysis = _safe_json_parse(row.get("analysis"))
+    created = row.get("created_at")
     
     return f"""
     <!DOCTYPE html>
