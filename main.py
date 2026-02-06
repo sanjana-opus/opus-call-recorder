@@ -2,62 +2,63 @@ from fastapi import FastAPI, Request, Form
 from fastapi.responses import Response, HTMLResponse
 from twilio.rest import Client
 from twilio.twiml.voice_response import VoiceResponse, Dial
-import anthropic
+import openai
+from supabase import create_client, Client as SupabaseClient
+from hubspot import HubSpot
+from hubspot.crm.contacts import SimplePublicObjectInputForCreate, ApiException as HubSpotApiException
 import httpx
-import sqlite3
 import json
 import os
-from datetime import datetime
+import re
+from datetime import datetime, timedelta
 from contextlib import asynccontextmanager
 from deepgram import DeepgramClient, PrerecordedOptions
-
-# Initialize database
-def init_db():
-    conn = sqlite3.connect('calls.db')
-    c = conn.cursor()
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS sales_calls (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            call_sid TEXT UNIQUE,
-            phone_number TEXT,
-            caller_name TEXT,
-            practice_name TEXT,
-            status TEXT,
-            transcript TEXT,
-            analysis TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            completed_at TIMESTAMP
-        )
-    ''')
-    conn.commit()
-    conn.close()
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    init_db()
-    yield
-
-app = FastAPI(lifespan=lifespan)
+import csv
+from io import StringIO
 
 # Environment variables
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "ACfa1aad34f3b4f8bb5f928c001e47ec65")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_PHONE_NUMBER = "+14694454221"
 
-# User phone numbers - map caller names to their phones
 USER_PHONE_NUMBERS = {
     "Sanjana": "+12145188667",
     "Carolina": "+17865434900",
     "Pranjal": "+12145188667"
 }
 
+# API Keys
 DEEPGRAM_API_KEY = "0426dca9f08f7c1d1621900e9f87cbd1c444f263"
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+HUBSPOT_API_KEY = os.getenv("HUBSPOT_API_KEY")
 
 # Initialize clients
 twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
 deepgram = DeepgramClient(DEEPGRAM_API_KEY)
+supabase: SupabaseClient = create_client(SUPABASE_URL, SUPABASE_KEY)
+hubspot_client = HubSpot(access_token=HUBSPOT_API_KEY) if HUBSPOT_API_KEY else None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    try:
+        supabase.table('sales_calls').select("id").limit(1).execute()
+        print("[STARTUP] ✅ Supabase connected")
+    except Exception as e:
+        print(f"[STARTUP] ⚠️ Supabase connection failed: {e}")
+    
+    if hubspot_client:
+        try:
+            hubspot_client.crm.contacts.basic_api.get_page(limit=1)
+            print("[STARTUP] ✅ HubSpot connected")
+        except Exception as e:
+            print(f"[STARTUP] ⚠️ HubSpot connection failed: {e}")
+    
+    yield
+
+app = FastAPI(lifespan=lifespan)
 
 @app.get("/", response_class=HTMLResponse)
 async def home():
@@ -126,12 +127,17 @@ async def home():
                 font-weight: 600;
                 cursor: pointer;
                 transition: transform 0.2s;
+                margin-bottom: 10px;
             }
             button:hover {
                 transform: translateY(-2px);
             }
             button:active {
                 transform: translateY(0);
+            }
+            .export-btn {
+                background: linear-gradient(135deg, #43cea2 0%, #185a9d 100%);
+                font-size: 16px;
             }
             #status {
                 margin-top: 20px;
@@ -208,6 +214,10 @@ async def home():
                 
                 <button type="submit">🚀 Start Call</button>
             </form>
+            
+            <button class="export-btn" onclick="window.open('/admin/export-csv', '_blank')">
+                📥 Download All Calls (CSV)
+            </button>
             
             <div id="status"></div>
             
@@ -307,45 +317,39 @@ async def home():
 @app.post("/start-call")
 async def start_call(request: Request):
     data = await request.json()
-    practice_number = data.get("phone_number")  # The practice you're calling
+    practice_number = data.get("phone_number")
     caller_name = data.get("caller_name")
     practice_name = data.get("practice_name", "")
     
-    # Get the caller's phone number based on who's calling
-    user_phone = USER_PHONE_NUMBERS.get(caller_name, "+12145188667")  # Default to Sanjana
-    
+    user_phone = USER_PHONE_NUMBERS.get(caller_name, "+12145188667")
     base_url = str(request.base_url).rstrip('/')
     
-    # URL encode the practice number to ensure it passes correctly
     from urllib.parse import quote
     encoded_practice_number = quote(practice_number, safe='')
     
     print(f"[START-CALL] Caller: {caller_name} ({user_phone})")
     print(f"[START-CALL] Practice number: {practice_number}")
-    print(f"[START-CALL] Encoded: {encoded_practice_number}")
     
     try:
-        # Call the selected person's phone first, then connect to practice
         call = twilio_client.calls.create(
-            to=user_phone,  # Call the selected person's phone!
+            to=user_phone,
             from_=TWILIO_PHONE_NUMBER,
-            url=f"{base_url}/voice?practice_number={encoded_practice_number}",  # Pass practice number as parameter
+            url=f"{base_url}/voice?practice_number={encoded_practice_number}",
             status_callback=f"{base_url}/call-status",
             status_callback_event=['completed'],
             record=True,
             recording_status_callback=f"{base_url}/recording-ready"
         )
         
-        print(f"[START-CALL] Call created: {call.sid}")
+        supabase.table('sales_calls').insert({
+            "call_sid": call.sid,
+            "phone_number": practice_number,
+            "caller_name": caller_name,
+            "practice_name": practice_name,
+            "status": "initiated"
+        }).execute()
         
-        conn = sqlite3.connect('calls.db')
-        c = conn.cursor()
-        c.execute("""
-            INSERT INTO sales_calls (call_sid, phone_number, caller_name, practice_name, status)
-            VALUES (?, ?, ?, ?, 'initiated')
-        """, (call.sid, practice_number, caller_name, practice_name))
-        conn.commit()
-        conn.close()
+        print(f"[SUPABASE] ✅ Call {call.sid} stored")
         
         return {"call_sid": call.sid, "status": "initiated"}
     
@@ -356,8 +360,6 @@ async def start_call(request: Request):
 @app.post("/voice")
 @app.get("/voice")
 async def voice(request: Request):
-    """TwiML instructions: You answer, then dial the practice"""
-    # Get the practice number from query params
     practice_number = request.query_params.get('practice_number', '')
     
     print(f"[VOICE] Practice number received: {practice_number}")
@@ -365,19 +367,16 @@ async def voice(request: Request):
     response = VoiceResponse()
     
     if not practice_number:
-        response.say("Error: No practice number provided. Please try again.", voice='Polly.Joanna')
-        print("[VOICE ERROR] No practice number in query params")
+        response.say("Error: No practice number provided.", voice='Polly.Joanna')
     else:
         response.say("Connecting you to the practice now.", voice='Polly.Joanna')
         response.dial(practice_number)
-        print(f"[VOICE] Dialing {practice_number}")
     
     return Response(content=str(response), media_type="application/xml")
 
 @app.post("/call-status")
 @app.get("/call-status")
 async def call_status(request: Request):
-    # Handle both GET (query params) and POST (form data)
     if request.method == "GET":
         call_sid = request.query_params.get("CallSid")
         status = request.query_params.get("CallStatus")
@@ -386,22 +385,19 @@ async def call_status(request: Request):
         call_sid = form.get("CallSid")
         status = form.get("CallStatus")
     
-    conn = sqlite3.connect('calls.db')
-    c = conn.cursor()
-    c.execute("""
-        UPDATE sales_calls 
-        SET status = ?
-        WHERE call_sid = ?
-    """, (status, call_sid))
-    conn.commit()
-    conn.close()
+    try:
+        supabase.table('sales_calls').update({
+            "status": status
+        }).eq('call_sid', call_sid).execute()
+        print(f"[SUPABASE] ✅ Updated status for {call_sid}: {status}")
+    except Exception as e:
+        print(f"[SUPABASE] ❌ Error updating status: {e}")
     
     return {"status": "updated"}
 
 @app.post("/recording-ready")
 @app.get("/recording-ready")
 async def recording_ready(request: Request):
-    # Handle both GET (query params) and POST (form data)
     if request.method == "GET":
         recording_sid = request.query_params.get("RecordingSid")
         call_sid = request.query_params.get("CallSid")
@@ -414,28 +410,27 @@ async def recording_ready(request: Request):
     
     print(f"[RECORDING-READY] Call: {call_sid}, Recording: {recording_sid}")
     
-    # Download recording
-    full_url = f"https://api.twilio.com{recording_url}.mp3" if not recording_url.startswith("http") else recording_url + ".mp3"
+    full_recording_url = f"https://api.twilio.com{recording_url}"
+    download_url = f"{full_recording_url}.mp3"
     
-    print(f"[RECORDING-READY] Downloading from: {full_url}")
+    print(f"[RECORDING-READY] Downloading from: {download_url}")
     
     async with httpx.AsyncClient() as client:
         auth = (TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-        recording_response = await client.get(full_url, auth=auth)
+        recording_response = await client.get(download_url, auth=auth)
         audio_data = recording_response.content
     
     print(f"[RECORDING-READY] Downloaded {len(audio_data)} bytes")
     
-    # Transcribe with Deepgram
     try:
-        print("[RECORDING-READY] Starting Deepgram transcription...")
+        print("[RECORDING-READY] Starting Deepgram transcription with diarization...")
         
         options = PrerecordedOptions(
             model="nova-2",
             smart_format=True,
-            diarize=True,  # Enable speaker separation
+            diarize=True,
             punctuate=True,
-            paragraphs=True,
+            utterances=True,
         )
         
         response = deepgram.listen.rest.v("1").transcribe_file(
@@ -443,73 +438,91 @@ async def recording_ready(request: Request):
             options
         )
         
-        # Get speaker-separated transcript
-        words = response["results"]["channels"][0]["alternatives"][0]["words"]
+        utterances = response.get("results", {}).get("utterances", [])
         
-        # Format transcript with speaker labels
-        formatted_transcript = []
-        current_speaker = None
-        current_text = []
-        
-        for word_info in words:
-            # Access as object attributes, not dict
-            speaker = getattr(word_info, 'speaker', 0)
-            word = getattr(word_info, 'word', '')
+        if utterances:
+            formatted_lines = []
+            for utt in utterances:
+                speaker_num = utt.get("speaker", 0)
+                text = utt.get("transcript", "")
+                speaker_label = "**You:**" if speaker_num == 0 else "**Practice:**"
+                formatted_lines.append(f"{speaker_label} {text}")
             
-            if speaker != current_speaker:
-                if current_text:
-                    speaker_label = "You" if current_speaker == 0 else "Practice"
-                    formatted_transcript.append(f"\n**{speaker_label}:** {' '.join(current_text)}")
-                    current_text = []
-                current_speaker = speaker
-            
-            current_text.append(word)
+            transcript = "\n\n".join(formatted_lines)
+            print(f"[RECORDING-READY] ✅ Used speaker diarization ({len(utterances)} utterances)")
+        else:
+            transcript = response["results"]["channels"][0]["alternatives"][0]["transcript"]
+            print(f"[RECORDING-READY] ⚠️ Diarization not available, using plain transcript")
         
-        # Add the last speaker's text
-        if current_text:
-            speaker_label = "You" if current_speaker == 0 else "Practice"
-            formatted_transcript.append(f"\n**{speaker_label}:** {' '.join(current_text)}")
-        
-        transcript = "\n".join(formatted_transcript).strip()
-        
-        # Also get plain text for Claude analysis
         plain_transcript = response["results"]["channels"][0]["alternatives"][0]["transcript"]
         
         print(f"[RECORDING-READY] Transcript received: {len(transcript)} characters")
         
-        # Analyze with Claude (use plain transcript for better analysis)
-        print("[RECORDING-READY] Starting Claude analysis...")
-        analysis = analyze_sales_call(plain_transcript)  # Use plain text for analysis
+        print("[RECORDING-READY] Starting OpenAI analysis...")
+        analysis = analyze_sales_call(plain_transcript)
         
         print("[RECORDING-READY] Analysis complete")
         
-        # Update database
-        conn = sqlite3.connect('calls.db')
-        c = conn.cursor()
-        c.execute("""
-            UPDATE sales_calls 
-            SET transcript = ?, analysis = ?, status = 'completed', completed_at = ?
-            WHERE call_sid = ?
-        """, (transcript, json.dumps(analysis), datetime.now().isoformat(), call_sid))
-        conn.commit()
-        conn.close()
+        try:
+            storage_path = f"recordings/{call_sid}.mp3"
+            supabase.storage.from_('call-recordings').upload(
+                storage_path,
+                audio_data,
+                {"content-type": "audio/mpeg"}
+            )
+            
+            storage_url = supabase.storage.from_('call-recordings').get_public_url(storage_path)
+            print(f"[SUPABASE] ✅ Recording uploaded: {storage_url}")
+            final_recording_url = storage_url
+        except Exception as e:
+            print(f"[SUPABASE] ⚠️ Storage upload failed: {e}, using Twilio URL")
+            final_recording_url = full_recording_url
         
-        print(f"[RECORDING-READY] Database updated for call {call_sid}")
+        supabase.table('sales_calls').update({
+            "transcript": transcript,
+            "analysis": analysis,
+            "recording_url": final_recording_url,
+            "status": "completed",
+            "completed_at": datetime.now().isoformat()
+        }).eq('call_sid', call_sid).execute()
+        
+        print(f"[SUPABASE] ✅ Database updated for call {call_sid}")
+        
+        call_data = supabase.table('sales_calls').select("*").eq('call_sid', call_sid).execute()
+        
+        if call_data.data and len(call_data.data) > 0:
+            call_record = call_data.data[0]
+            phone_number = call_record.get('phone_number')
+            caller_name = call_record.get('caller_name')
+            practice_name = call_record.get('practice_name') or analysis.get('practice_name', 'Unknown')
+            
+            if hubspot_client and phone_number:
+                print("[HUBSPOT] Starting sync...")
+                
+                hubspot_result = create_or_update_hubspot_contact(
+                    phone_number=phone_number,
+                    practice_name=practice_name,
+                    caller_name=caller_name,
+                    analysis=analysis,
+                    call_sid=call_sid,
+                    recording_url=final_recording_url
+                )
+                
+                if hubspot_result.get("action") in ["created", "updated"]:
+                    contact_id = hubspot_result["contact_id"]
+                    add_contact_to_sales_pipeline(contact_id, analysis)
+                    add_hubspot_note(contact_id, analysis, final_recording_url, call_sid)
+                    print(f"[HUBSPOT] ✅ Sync complete for contact {contact_id}")
         
     except Exception as e:
         print(f"[RECORDING-READY ERROR] {str(e)}")
         import traceback
         traceback.print_exc()
         
-        conn = sqlite3.connect('calls.db')
-        c = conn.cursor()
-        c.execute("""
-            UPDATE sales_calls 
-            SET status = 'error'
-            WHERE call_sid = ?
-        """, (call_sid,))
-        conn.commit()
-        conn.close()
+        try:
+            supabase.table('sales_calls').update({"status": "error"}).eq('call_sid', call_sid).execute()
+        except:
+            pass
     
     return {"status": "processed"}
 
@@ -521,39 +534,43 @@ The call is between a sales representative from Opus Health and a dental/medical
 Transcript:
 {transcript}
 
-Carefully extract the following information. If something is not mentioned or unclear, use "Not mentioned" or "Unknown" rather than making assumptions:
+Carefully extract the following information. If something is not mentioned or unclear, use "Not mentioned" or "Unknown" rather than making assumptions.
 
-Extract and return as JSON:
-{{
-    "practice_name": "The actual name of the practice if mentioned, or 'Not mentioned'",
-    "practice_type": "dental/weight loss/medical/veterinary/other - determine from context",
-    "pain_points": ["Specific problems or frustrations the practice mentioned about their current payment/billing process. Be specific. If none mentioned, use empty array"],
-    "objections": ["Specific concerns, hesitations, or reasons for not moving forward that were explicitly stated. If none, use empty array"],
-    "value_props_resonated": ["Which benefits of Opus Health seemed to interest them based on their responses. Be specific. If none clear, use empty array"],
-    "next_steps": "Specific actions agreed upon (e.g., 'Send email with pricing', 'Schedule demo for next week', 'Call back in 2 days'). If none agreed, say 'No specific next steps agreed'",
-    "conversion_likelihood": "high/medium/low/none - high if they committed to next steps or showed strong interest, medium if interested but cautious, low if polite but not interested, none if rejected",
-    "key_quotes": ["1-3 notable things the practice representative said, word-for-word if possible. Focus on meaningful statements about their needs or interest level. If transcript is too short or unclear, use empty array"],
-    "summary": "2-3 sentence summary: What was discussed, how did the practice respond, and what's the outcome/status"
-}}
+Return your analysis as a JSON object with these exact fields:
+- practice_name: The actual name of the practice if mentioned, or 'Not mentioned'
+- practice_type: dental/weight loss/medical/veterinary/other
+- pain_points: Array of specific problems mentioned
+- objections: Array of concerns or reasons for hesitation
+- value_props_resonated: Array of Opus Health benefits that interested them
+- next_steps: Specific actions agreed upon
+- conversion_likelihood: high/medium/low/none
+- key_quotes: Array of 1-3 notable quotes from the practice
+- summary: 2-3 sentence summary of the call
 
-Be specific and accurate. Only include information that is actually present in the transcript."""
+Be specific and accurate. Only include information actually present in the transcript."""
     
     try:
-        message = anthropic_client.messages.create(
-            model="claude-sonnet-4-20250514",
+        response = openai_client.chat.completions.create(
+            model="gpt-4-turbo-preview",
+            messages=[
+                {"role": "system", "content": "You are a sales call analyzer. Always respond with valid JSON only, no other text."},
+                {"role": "user", "content": prompt}
+            ],
+            response_format={"type": "json_object"},
             max_tokens=2000,
-            messages=[{"role": "user", "content": prompt}]
+            temperature=0.3
         )
         
-        # Extract JSON from response
-        response_text = message.content[0].text
-        # Try to find JSON in the response
-        import re
-        json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
-        if json_match:
-            return json.loads(json_match.group())
-        else:
+        response_text = response.choices[0].message.content
+        
+        try:
             return json.loads(response_text)
+        except json.JSONDecodeError:
+            json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+            if json_match:
+                return json.loads(json_match.group())
+            raise
+            
     except Exception as e:
         print(f"[ANALYSIS ERROR] {str(e)}")
         return {
@@ -568,115 +585,264 @@ Be specific and accurate. Only include information that is actually present in t
             "summary": f"Error analyzing call: {str(e)}"
         }
 
+def create_or_update_hubspot_contact(phone_number: str, practice_name: str, caller_name: str, analysis: dict, call_sid: str, recording_url: str):
+    if not hubspot_client:
+        print("[HUBSPOT] Skipping - no API key configured")
+        return {"action": "skipped"}
+    
+    try:
+        properties = {
+            "phone": phone_number,
+            "company": practice_name or "Unknown Practice",
+            "lifecyclestage": "lead",
+            "hs_lead_status": "NEW",
+        }
+        
+        try:
+            search_results = hubspot_client.crm.contacts.search_api.do_search(
+                public_object_search_request={
+                    "filterGroups": [{
+                        "filters": [{
+                            "propertyName": "phone",
+                            "operator": "EQ",
+                            "value": phone_number
+                        }]
+                    }]
+                }
+            )
+            
+            if search_results.total > 0:
+                contact_id = search_results.results[0].id
+                hubspot_client.crm.contacts.basic_api.update(
+                    contact_id=contact_id,
+                    simple_public_object_input={"properties": properties}
+                )
+                print(f"[HUBSPOT] ✅ Updated contact: {contact_id}")
+                return {"action": "updated", "contact_id": contact_id}
+            else:
+                new_contact = SimplePublicObjectInputForCreate(properties=properties)
+                created_contact = hubspot_client.crm.contacts.basic_api.create(
+                    simple_public_object_input_for_create=new_contact
+                )
+                print(f"[HUBSPOT] ✅ Created contact: {created_contact.id}")
+                return {"action": "created", "contact_id": created_contact.id}
+                
+        except HubSpotApiException as e:
+            print(f"[HUBSPOT] ⚠️ Search/create error: {e}")
+            return {"action": "failed", "error": str(e)}
+            
+    except Exception as e:
+        print(f"[HUBSPOT] ❌ Error: {str(e)}")
+        return {"action": "failed", "error": str(e)}
+
+def add_contact_to_sales_pipeline(contact_id: str, analysis: dict):
+    if not hubspot_client:
+        return {"success": False, "error": "No HubSpot client"}
+    
+    try:
+        likelihood = analysis.get('conversion_likelihood', 'low')
+        
+        stage_mapping = {
+            "high": "appointmentscheduled",
+            "medium": "qualifiedtobuy",
+            "low": "presentationscheduled",
+            "none": "leadstatusopen"
+        }
+        
+        deal_properties = {
+            "dealname": f"Sales Call - {contact_id}",
+            "dealstage": stage_mapping.get(likelihood, "leadstatusopen"),
+            "pipeline": "default",
+            "closedate": (datetime.now() + timedelta(days=30)).isoformat()
+        }
+        
+        deal_input = SimplePublicObjectInputForCreate(properties=deal_properties)
+        created_deal = hubspot_client.crm.deals.basic_api.create(
+            simple_public_object_input_for_create=deal_input
+        )
+        
+        hubspot_client.crm.deals.associations_api.create(
+            deal_id=created_deal.id,
+            to_object_type="contacts",
+            to_object_id=contact_id,
+            association_type="deal_to_contact"
+        )
+        
+        print(f"[HUBSPOT] ✅ Created deal {created_deal.id}")
+        return {"success": True, "deal_id": created_deal.id}
+        
+    except Exception as e:
+        print(f"[HUBSPOT] ❌ Deal creation error: {str(e)}")
+        return {"success": False, "error": str(e)}
+
+def add_hubspot_note(contact_id: str, analysis: dict, recording_url: str, call_sid: str):
+    if not hubspot_client:
+        return {"success": False}
+    
+    try:
+        note_body = f"""
+📞 Call Summary - {datetime.now().strftime('%Y-%m-%d %H:%M')}
+
+🏥 Practice: {analysis.get('practice_name', 'Unknown')}
+📋 Type: {analysis.get('practice_type', 'Unknown')}
+📊 Conversion Likelihood: {analysis.get('conversion_likelihood', 'unknown').upper()}
+
+📝 Summary:
+{analysis.get('summary', 'No summary available')}
+
+😣 Pain Points:
+{chr(10).join(f"• {p}" for p in analysis.get('pain_points', [])) or 'None mentioned'}
+
+🚫 Objections:
+{chr(10).join(f"• {o}" for o in analysis.get('objections', [])) or 'None raised'}
+
+✅ Value Props That Resonated:
+{chr(10).join(f"• {v}" for v in analysis.get('value_props_resonated', [])) or 'None identified'}
+
+➡️ Next Steps:
+{analysis.get('next_steps', 'No next steps defined')}
+
+💬 Key Quotes:
+{chr(10).join(f'"{q}"' for q in analysis.get('key_quotes', [])) or 'None captured'}
+
+🎙️ Recording: {recording_url}
+        """.strip()
+        
+        note_properties = {
+            "hs_timestamp": datetime.now().isoformat(),
+            "hs_note_body": note_body
+        }
+        
+        note_input = SimplePublicObjectInputForCreate(properties=note_properties)
+        created_note = hubspot_client.crm.objects.notes.basic_api.create(
+            simple_public_object_input_for_create=note_input
+        )
+        
+        hubspot_client.crm.objects.notes.associations_api.create(
+            note_id=created_note.id,
+            to_object_type="contacts",
+            to_object_id=contact_id,
+            association_type="note_to_contact"
+        )
+        
+        print(f"[HUBSPOT] ✅ Added note to contact {contact_id}")
+        return {"success": True, "note_id": created_note.id}
+        
+    except Exception as e:
+        print(f"[HUBSPOT] ❌ Note creation error: {str(e)}")
+        return {"success": False, "error": str(e)}
+
 @app.get("/calls/recent")
 async def recent_calls():
-    conn = sqlite3.connect('calls.db')
-    c = conn.cursor()
-    c.execute("""
-        SELECT call_sid, phone_number, caller_name, practice_name, status, created_at, transcript
-        FROM sales_calls
-        ORDER BY created_at DESC
-        LIMIT 10
-    """)
-    
-    calls = []
-    for row in c.fetchall():
-        calls.append({
-            "call_sid": row[0],
-            "phone_number": row[1],
-            "caller_name": row[2],
-            "practice_name": row[3],
-            "status": row[4],
-            "created_at": row[5],
-            "transcript": row[6] is not None
-        })
-    
-    conn.close()
-    return calls
+    try:
+        result = supabase.table('sales_calls').select(
+            "call_sid, phone_number, caller_name, practice_name, status, created_at, transcript"
+        ).order('created_at', desc=True).limit(10).execute()
+        
+        calls = []
+        for row in result.data:
+            calls.append({
+                "call_sid": row['call_sid'],
+                "phone_number": row['phone_number'],
+                "caller_name": row['caller_name'],
+                "practice_name": row['practice_name'],
+                "status": row['status'],
+                "created_at": row['created_at'],
+                "transcript": row['transcript'] is not None
+            })
+        
+        return calls
+    except Exception as e:
+        print(f"[SUPABASE] ❌ Error fetching calls: {e}")
+        return []
 
 @app.get("/admin/export-csv")
 async def export_csv():
-    """Export all calls data as CSV - includes transcripts and analysis"""
-    import csv
-    from io import StringIO
-    
-    conn = sqlite3.connect('calls.db')
-    c = conn.cursor()
-    c.execute("""
-        SELECT call_sid, phone_number, caller_name, practice_name, 
-               status, created_at, completed_at, transcript, analysis
-        FROM sales_calls
-        ORDER BY created_at DESC
-    """)
-    
-    output = StringIO()
-    writer = csv.writer(output)
-    
-    # Header
-    writer.writerow([
-        'Call ID', 'Phone Number', 'Caller', 'Practice Name', 
-        'Status', 'Created At', 'Completed At', 'Transcript',
-        'Practice Type', 'Pain Points', 'Objections', 
-        'Value Props Resonated', 'Next Steps', 'Conversion Likelihood',
-        'Key Quotes', 'Summary'
-    ])
-    
-    # Data
-    for row in c.fetchall():
-        call_sid, phone, caller, practice, status, created, completed, transcript, analysis_json = row
+    try:
+        result = supabase.table('sales_calls').select("*").order('created_at', desc=True).execute()
         
-        # Parse analysis JSON
-        if analysis_json:
-            try:
-                analysis = json.loads(analysis_json)
-                practice_type = analysis.get('practice_type', '')
-                pain_points = '; '.join(analysis.get('pain_points', []))
-                objections = '; '.join(analysis.get('objections', []))
-                value_props = '; '.join(analysis.get('value_props_resonated', []))
-                next_steps = analysis.get('next_steps', '')
-                likelihood = analysis.get('conversion_likelihood', '')
-                quotes = '; '.join(analysis.get('key_quotes', []))
-                summary = analysis.get('summary', '')
-            except:
-                practice_type = pain_points = objections = value_props = next_steps = likelihood = quotes = summary = ''
-        else:
-            practice_type = pain_points = objections = value_props = next_steps = likelihood = quotes = summary = ''
+        output = StringIO()
+        writer = csv.writer(output)
         
         writer.writerow([
-            call_sid, phone, caller, practice, status, created, completed,
-            transcript or '', practice_type, pain_points, objections,
-            value_props, next_steps, likelihood, quotes, summary
+            'Call ID', 'Phone Number', 'Caller', 'Practice Name', 
+            'Status', 'Created At', 'Completed At', 'Transcript',
+            'Practice Type', 'Pain Points', 'Objections', 
+            'Value Props Resonated', 'Next Steps', 'Conversion Likelihood',
+            'Key Quotes', 'Summary', 'Recording URL'
         ])
-    
-    conn.close()
-    
-    # Return CSV file
-    return Response(
-        content=output.getvalue(),
-        media_type="text/csv",
-        headers={
-            "Content-Disposition": f"attachment; filename=opus_calls_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        }
-    )
+        
+        for row in result.data:
+            call_sid = row['call_sid']
+            phone = row['phone_number']
+            caller = row['caller_name']
+            practice = row['practice_name']
+            status = row['status']
+            created = row['created_at']
+            completed = row.get('completed_at', '')
+            transcript = row.get('transcript', '')
+            analysis_data = row.get('analysis', {})
+            rec_url = row.get('recording_url', '')
+            
+            if isinstance(analysis_data, str):
+                try:
+                    analysis = json.loads(analysis_data)
+                except:
+                    analysis = {}
+            else:
+                analysis = analysis_data or {}
+            
+            practice_type = analysis.get('practice_type', '')
+            pain_points = '; '.join(analysis.get('pain_points', []))
+            objections = '; '.join(analysis.get('objections', []))
+            value_props = '; '.join(analysis.get('value_props_resonated', []))
+            next_steps = analysis.get('next_steps', '')
+            likelihood = analysis.get('conversion_likelihood', '')
+            quotes = '; '.join(analysis.get('key_quotes', []))
+            summary = analysis.get('summary', '')
+            
+            writer.writerow([
+                call_sid, phone, caller, practice, status, created, completed,
+                transcript or '', practice_type, pain_points, objections,
+                value_props, next_steps, likelihood, quotes, summary, rec_url
+            ])
+        
+        return Response(
+            content=output.getvalue(),
+            media_type="text/csv",
+            headers={
+                "Content-Disposition": f"attachment; filename=opus_calls_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            }
+        )
+    except Exception as e:
+        print(f"[CSV EXPORT ERROR] {e}")
+        return {"error": str(e)}
 
 @app.get("/call/{call_sid}", response_class=HTMLResponse)
 async def view_call(call_sid: str):
-    conn = sqlite3.connect('calls.db')
-    c = conn.cursor()
-    c.execute("""
-        SELECT phone_number, caller_name, practice_name, transcript, analysis, created_at
-        FROM sales_calls
-        WHERE call_sid = ?
-    """, (call_sid,))
+    try:
+        result = supabase.table('sales_calls').select(
+            "phone_number, caller_name, practice_name, transcript, analysis, created_at, recording_url"
+        ).eq('call_sid', call_sid).execute()
+        
+        if not result.data or len(result.data) == 0:
+            return "<h1>Call not found</h1>"
+        
+        row = result.data[0]
+        phone = row['phone_number']
+        caller = row['caller_name']
+        practice = row['practice_name']
+        transcript = row['transcript']
+        analysis = row['analysis'] if isinstance(row['analysis'], dict) else json.loads(row['analysis'] or '{}')
+        created = row['created_at']
+        recording_url = row.get('recording_url', '')
+    except Exception as e:
+        print(f"[SUPABASE] ❌ Error fetching call: {e}")
+        return f"<h1>Error loading call: {e}</h1>"
     
-    row = c.fetchone()
-    conn.close()
-    
-    if not row:
-        return "<h1>Call not found</h1>"
-    
-    phone, caller, practice, transcript, analysis_json, created = row
-    analysis = json.loads(analysis_json) if analysis_json else {}
+    recording_link = ""
+    if recording_url:
+        recording_link = f'<p><strong>Recording:</strong> <a href="{recording_url}" download style="color: #667eea;">Download MP3</a></p>'
     
     return f"""
     <!DOCTYPE html>
@@ -742,6 +908,8 @@ async def view_call(call_sid: str):
             <div class="meta">
                 By {caller} • {practice or 'Unknown Practice'} • {created}
             </div>
+            
+            {recording_link}
             
             <div class="section">
                 <h2>📊 AI Analysis</h2>
