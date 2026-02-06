@@ -23,8 +23,7 @@ TWILIO_PHONE_NUMBER = "+14694454221"
 
 USER_PHONE_NUMBERS = {
     "Sanjana": "+12145188667",
-    "Carolina": "+17865434900",
-    "Pranjal": "+12145188667"
+    "Carolina": "+17865434900"
 }
 
 # API Keys
@@ -203,7 +202,6 @@ async def home():
                     <select id="caller" required>
                         <option value="Sanjana">Sanjana (+1-214-518-8667)</option>
                         <option value="Carolina">Carolina (+1-786-543-4900)</option>
-                        <option value="Pranjal">Pranjal</option>
                     </select>
                 </div>
                 
