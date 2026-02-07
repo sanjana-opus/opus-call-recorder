@@ -440,7 +440,10 @@ async def recording_ready(request: Request):
             options
         )
         
-        utterances = response.get("results", {}).get("utterances", [])
+        # Convert response to dict
+        response_dict = response.to_dict()
+        
+        utterances = response_dict.get("results", {}).get("utterances", [])
         
         if utterances:
             formatted_lines = []
@@ -453,10 +456,10 @@ async def recording_ready(request: Request):
             transcript = "\n\n".join(formatted_lines)
             print(f"[RECORDING-READY] ✅ Used speaker diarization ({len(utterances)} utterances)")
         else:
-            transcript = response["results"]["channels"][0]["alternatives"][0]["transcript"]
+            transcript = response_dict["results"]["channels"][0]["alternatives"][0]["transcript"]
             print(f"[RECORDING-READY] ⚠️ Diarization not available, using plain transcript")
         
-        plain_transcript = response["results"]["channels"][0]["alternatives"][0]["transcript"]
+        plain_transcript = response_dict["results"]["channels"][0]["alternatives"][0]["transcript"]
         
         print(f"[RECORDING-READY] Transcript received: {len(transcript)} characters")
         
