@@ -263,8 +263,7 @@ async def home():
                 const caller = document.getElementById('caller').value;
                 const phoneNumbers = {
                     'Sanjana': '+1-214-518-8667',
-                    'Carolina': '+1-786-543-4900',
-                    'Pranjal': '+1-214-518-8667'
+                    'Carolina': '+1-786-543-4900'
                 };
                 
                 statusDiv.style.display = 'block';
