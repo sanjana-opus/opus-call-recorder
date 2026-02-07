@@ -407,7 +407,12 @@ async def recording_ready(request: Request):
     
     print(f"[RECORDING-READY] Call: {call_sid}, Recording: {recording_sid}")
     
-    full_recording_url = f"https://api.twilio.com{recording_url}"
+    # Handle both relative and absolute URLs from Twilio
+    if recording_url.startswith("http"):
+        full_recording_url = recording_url
+    else:
+        full_recording_url = f"https://api.twilio.com{recording_url}"
+    
     download_url = f"{full_recording_url}.mp3"
     
     print(f"[RECORDING-READY] Downloading from: {download_url}")
