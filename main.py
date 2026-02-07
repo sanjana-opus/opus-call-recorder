@@ -600,7 +600,7 @@ def create_or_update_hubspot_contact(phone_number: str, practice_name: str, call
             "phone": phone_number,
             "company": practice_name or "Unknown Practice",
             "lifecyclestage": "lead",
-            "hs_lead_status": "NEW",
+            "hs_lead_status": "OPEN",
         }
         
         try:
