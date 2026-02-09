@@ -556,13 +556,13 @@ Be specific and accurate. Only include information actually present in the trans
     
     try:
         response = openai_client.chat.completions.create(
-            model="gpt-5-mini",
+            model="gpt-4o",
             messages=[
                 {"role": "system", "content": "You are a sales call analyzer. Always respond with valid JSON only, no other text."},
                 {"role": "user", "content": prompt}
             ],
             response_format={"type": "json_object"},
-            max_tokens=2000,
+            max_completion_tokens=2000,
             temperature=0.3
         )
         
