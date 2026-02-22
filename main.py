@@ -4,8 +4,7 @@ from twilio.rest import Client
 from twilio.twiml.voice_response import VoiceResponse, Dial
 import openai
 from supabase import create_client, Client as SupabaseClient
-from hubspot import HubSpot
-from hubspot.crm.contacts import SimplePublicObjectInputForCreate, ApiException as HubSpotApiException
+import requests as hs_requests
 import httpx
 import json
 import os
@@ -17,7 +16,7 @@ import csv
 from io import StringIO
 
 # Environment variables
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", os.getenv("TWILIO_ACCOUNT_SID"))
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_PHONE_NUMBER = "+14694454221"
 
@@ -41,7 +40,15 @@ twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
 deepgram = DeepgramClient(DEEPGRAM_API_KEY)
 supabase: SupabaseClient = create_client(SUPABASE_URL, SUPABASE_KEY)
-hubspot_client = HubSpot(access_token=HUBSPOT_API_KEY) if HUBSPOT_API_KEY else None
+def hs(method, path, **kwargs):
+    """Direct HubSpot REST API call — no SDK needed."""
+    url = f"https://api.hubapi.com{path}"
+    headers = {"Authorization": f"Bearer {HUBSPOT_API_KEY}", "Content-Type": "application/json"}
+    resp = hs_requests.request(method, url, headers=headers, **kwargs)
+    resp.raise_for_status()
+    return resp.json() if resp.content else {}
+
+hubspot_client = bool(HUBSPOT_API_KEY)  # True/False flag for backward compat
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -51,9 +58,9 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"[STARTUP] ⚠️ Supabase connection failed: {e}")
     
-    if hubspot_client:
+    if HUBSPOT_API_KEY:
         try:
-            hubspot_client.crm.contacts.basic_api.get_page(limit=1)
+            hs("GET", "/crm/v3/objects/contacts?limit=1")
             print("[STARTUP] ✅ HubSpot connected")
         except Exception as e:
             print(f"[STARTUP] ⚠️ HubSpot connection failed: {e}")
@@ -627,21 +634,16 @@ def enroll_in_lgm_audience(contact_id: str, email: str, phone: str, practice_nam
     practice_type = analysis.get("practice_type", "unknown")
 
     # Step 1: Update HubSpot contact
-    if hubspot_client:
+    if HUBSPOT_API_KEY and contact_id:
         try:
-            hubspot_client.crm.contacts.basic_api.update(
-                contact_id=contact_id,
-                simple_public_object_input={
-                    "properties": {
-                        "lgm_ready":             "true",
-                        "lgm_enrolled_date":     datetime.now().strftime("%Y-%m-%d"),
-                        "last_call_disposition": likelihood,
-                        "practice_vertical":     practice_type,
-                        "call_next_steps":       analysis.get("next_steps", ""),
-                        "call_summary":          analysis.get("summary", ""),
-                    }
-                }
-            )
+            hs("PATCH", f"/crm/v3/objects/contacts/{contact_id}", json={"properties": {
+                "lgm_ready":             "true",
+                "lgm_enrolled_date":     datetime.now().strftime("%Y-%m-%d"),
+                "last_call_disposition": likelihood,
+                "practice_vertical":     practice_type,
+                "call_next_steps":       str(analysis.get("next_steps", "")),
+                "call_summary":          analysis.get("summary", ""),
+            }})
             print(f"[LGM] HubSpot contact {contact_id} flagged lgm_ready=true")
         except Exception as e:
             print(f"[LGM] HubSpot update failed: {e}")
@@ -678,154 +680,118 @@ def enroll_in_lgm_audience(contact_id: str, email: str, phone: str, practice_nam
 
 
 def create_or_update_hubspot_contact(phone_number: str, practice_name: str, caller_name: str, analysis: dict, call_sid: str, recording_url: str):
-    if not hubspot_client:
+    if not HUBSPOT_API_KEY:
         print("[HUBSPOT] Skipping - no API key configured")
         return {"action": "skipped"}
 
-    # Pull verified email from Supabase if available
     email = get_email_for_phone(phone_number)
 
+    properties = {
+        "phone":          phone_number,
+        "company":        practice_name or "Unknown Practice",
+        "lifecyclestage": "lead",
+        "hs_lead_status": "OPEN",
+    }
+    if email:
+        properties["email"] = email
+        print(f"[HUBSPOT] Enriching with verified email: {email}")
+
     try:
-        properties = {
-            "phone":          phone_number,
-            "company":        practice_name or "Unknown Practice",
-            "lifecyclestage": "lead",
-            "hs_lead_status": "OPEN",
-        }
-        if email:
-            properties["email"] = email
-            print(f"[HUBSPOT] Enriching with verified email: {email}")
+        # Search for existing contact by phone
+        search = hs("POST", "/crm/v3/objects/contacts/search", json={
+            "filterGroups": [{"filters": [{"propertyName": "phone", "operator": "EQ", "value": phone_number}]}]
+        })
+        results = search.get("results", [])
 
-        try:
-            search_results = hubspot_client.crm.contacts.search_api.do_search(
-                public_object_search_request={
-                    "filterGroups": [{
-                        "filters": [{
-                            "propertyName": "phone",
-                            "operator": "EQ",
-                            "value": phone_number
-                        }]
-                    }]
-                }
-            )
-
-            if search_results.total > 0:
-                contact_id = search_results.results[0].id
-                hubspot_client.crm.contacts.basic_api.update(
-                    contact_id=contact_id,
-                    simple_public_object_input={"properties": properties}
-                )
-                print(f"[HUBSPOT] ✅ Updated contact: {contact_id}")
-                return {"action": "updated", "contact_id": contact_id}
-            else:
-                new_contact = SimplePublicObjectInputForCreate(properties=properties)
-                created_contact = hubspot_client.crm.contacts.basic_api.create(
-                    simple_public_object_input_for_create=new_contact
-                )
-                print(f"[HUBSPOT] ✅ Created contact: {created_contact.id}")
-                return {"action": "created", "contact_id": created_contact.id}
-
-        except HubSpotApiException as e:
-            print(f"[HUBSPOT] ⚠️ Search/create error: {e}")
-            return {"action": "failed", "error": str(e)}
+        if results:
+            contact_id = results[0]["id"]
+            hs("PATCH", f"/crm/v3/objects/contacts/{contact_id}", json={"properties": properties})
+            print(f"[HUBSPOT] ✅ Updated contact: {contact_id}")
+            return {"action": "updated", "contact_id": contact_id}
+        else:
+            created = hs("POST", "/crm/v3/objects/contacts", json={"properties": properties})
+            contact_id = created["id"]
+            print(f"[HUBSPOT] ✅ Created contact: {contact_id}")
+            return {"action": "created", "contact_id": contact_id}
 
     except Exception as e:
         print(f"[HUBSPOT] ❌ Error: {str(e)}")
         return {"action": "failed", "error": str(e)}
 
 def add_contact_to_sales_pipeline(contact_id: str, analysis: dict):
-    if not hubspot_client:
-        return {"success": False, "error": "No HubSpot client"}
-    
+    if not HUBSPOT_API_KEY:
+        return {"success": False, "error": "No HubSpot key"}
+
     try:
-        likelihood = analysis.get('conversion_likelihood', 'low')
-        
+        likelihood = analysis.get("conversion_likelihood", "low")
         stage_mapping = {
-            "high": "appointmentscheduled",
+            "high":   "appointmentscheduled",
             "medium": "qualifiedtobuy",
-            "low": "presentationscheduled",
-            "none": "leadstatusopen"
+            "low":    "presentationscheduled",
+            "none":   "leadstatusopen"
         }
-        
-        deal_properties = {
-            "dealname": f"Sales Call - {contact_id}",
+        deal = hs("POST", "/crm/v3/objects/deals", json={"properties": {
+            "dealname":  f"Sales Call - {contact_id}",
             "dealstage": stage_mapping.get(likelihood, "leadstatusopen"),
-            "pipeline": "default",
+            "pipeline":  "default",
             "closedate": (datetime.now() + timedelta(days=30)).isoformat()
-        }
-        
-        deal_input = SimplePublicObjectInputForCreate(properties=deal_properties)
-        created_deal = hubspot_client.crm.deals.basic_api.create(
-            simple_public_object_input_for_create=deal_input
-        )
-        
-        hubspot_client.crm.deals.associations_api.create(
-            deal_id=created_deal.id,
-            to_object_type="contacts",
-            to_object_id=contact_id,
-            association_type="deal_to_contact"
-        )
-        
-        print(f"[HUBSPOT] ✅ Created deal {created_deal.id}")
-        return {"success": True, "deal_id": created_deal.id}
-        
+        }})
+        deal_id = deal["id"]
+        # Associate deal to contact
+        hs("PUT", f"/crm/v4/objects/deals/{deal_id}/associations/contacts/{contact_id}", json=[
+            {"associationCategory": "HUBSPOT_DEFINED", "associationTypeId": 3}
+        ])
+        print(f"[HUBSPOT] ✅ Created deal {deal_id}")
+        return {"success": True, "deal_id": deal_id}
     except Exception as e:
         print(f"[HUBSPOT] ❌ Deal creation error: {str(e)}")
         return {"success": False, "error": str(e)}
 
 def add_hubspot_note(contact_id: str, analysis: dict, recording_url: str, call_sid: str):
-    if not hubspot_client:
+    if not HUBSPOT_API_KEY:
         return {"success": False}
-    
+
     try:
-        note_body = f"""
-📞 Call Summary - {datetime.now().strftime('%Y-%m-%d %H:%M')}
+        pain_points = analysis.get("pain_points", [])
+        objections  = analysis.get("objections", [])
+        value_props = analysis.get("value_props_resonated", [])
+        key_quotes  = analysis.get("key_quotes", [])
+        next_steps  = analysis.get("next_steps", "No next steps defined")
 
-🏥 Practice: {analysis.get('practice_name', 'Unknown')}
-📋 Type: {analysis.get('practice_type', 'Unknown')}
-📊 Conversion Likelihood: {analysis.get('conversion_likelihood', 'unknown').upper()}
+        pp_str = "".join(f"• {p}\n" for p in pain_points) or "None mentioned"
+        obj_str = "".join(f"• {o}\n" for o in objections) or "None raised"
+        vp_str  = "".join(f"• {v}\n" for v in value_props) or "None identified"
+        kq_str  = "".join(f'"{q}"\n' for q in key_quotes) or "None captured"
+        conv    = analysis.get("conversion_likelihood", "unknown").upper()
+        summary = analysis.get("summary", "No summary available")
+        pname   = analysis.get("practice_name", "Unknown")
+        ptype   = analysis.get("practice_type", "Unknown")
+        ts      = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-📝 Summary:
-{analysis.get('summary', 'No summary available')}
+        note_body = (
+            f"📞 Call Summary - {ts}\n\n"
+            f"🏥 Practice: {pname}\n"
+            f"📋 Type: {ptype}\n"
+            f"📊 Conversion Likelihood: {conv}\n\n"
+            f"📝 Summary:\n{summary}\n\n"
+            f"😣 Pain Points:\n{pp_str}\n"
+            f"🚫 Objections:\n{obj_str}\n"
+            f"✅ Value Props That Resonated:\n{vp_str}\n"
+            f"➡️ Next Steps:\n{next_steps}\n\n"
+            f"💬 Key Quotes:\n{kq_str}\n"
+            f"🎙️ Recording: {recording_url}"
+        ).strip()
 
-😣 Pain Points:
-{chr(10).join(f"• {p}" for p in analysis.get('pain_points', [])) or 'None mentioned'}
-
-🚫 Objections:
-{chr(10).join(f"• {o}" for o in analysis.get('objections', [])) or 'None raised'}
-
-✅ Value Props That Resonated:
-{chr(10).join(f"• {v}" for v in analysis.get('value_props_resonated', [])) or 'None identified'}
-
-➡️ Next Steps:
-{analysis.get('next_steps', 'No next steps defined')}
-
-💬 Key Quotes:
-{chr(10).join(f'"{q}"' for q in analysis.get('key_quotes', [])) or 'None captured'}
-
-🎙️ Recording: {recording_url}
-        """.strip()
-        
-        note_properties = {
-            "hs_timestamp": datetime.now().isoformat(),
+        note = hs("POST", "/crm/v3/objects/notes", json={"properties": {
+            "hs_timestamp": str(int(datetime.now().timestamp() * 1000)),
             "hs_note_body": note_body
-        }
-        
-        note_input = SimplePublicObjectInputForCreate(properties=note_properties)
-        created_note = hubspot_client.crm.objects.notes.basic_api.create(
-            simple_public_object_input_for_create=note_input
-        )
-        
-        hubspot_client.crm.objects.notes.associations_api.create(
-            note_id=created_note.id,
-            to_object_type="contacts",
-            to_object_id=contact_id,
-            association_type="note_to_contact"
-        )
-        
+        }})
+        note_id = note["id"]
+        hs("PUT", f"/crm/v4/objects/notes/{note_id}/associations/contacts/{contact_id}", json=[
+            {"associationCategory": "HUBSPOT_DEFINED", "associationTypeId": 214}
+        ])
         print(f"[HUBSPOT] ✅ Added note to contact {contact_id}")
-        return {"success": True, "note_id": created_note.id}
-        
+        return {"success": True, "note_id": note_id}
     except Exception as e:
         print(f"[HUBSPOT] ❌ Note creation error: {str(e)}")
         return {"success": False, "error": str(e)}
