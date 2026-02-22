@@ -17,7 +17,7 @@ import csv
 from io import StringIO
 
 # Environment variables
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "ACfa1aad34f3b4f8bb5f928c001e47ec65")
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_PHONE_NUMBER = "+14694454221"
 
@@ -32,6 +32,9 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 HUBSPOT_API_KEY = os.getenv("HUBSPOT_API_KEY")
+LGM_API_KEY     = os.getenv("LGM_API_KEY")
+LGM_AUDIENCE_ID = os.getenv("LGM_AUDIENCE_ID")
+HUNTER_API_KEY  = os.getenv("HUNTER_API_KEY")
 
 # Initialize clients
 twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
@@ -517,6 +520,11 @@ async def recording_ready(request: Request):
                     contact_id = hubspot_result["contact_id"]
                     add_contact_to_sales_pipeline(contact_id, analysis)
                     add_hubspot_note(contact_id, analysis, final_recording_url, call_sid)
+                    if analysis.get("conversion_likelihood") in ["high", "medium"]:
+                        email = get_email_for_phone(phone_number)
+                        enroll_in_lgm_audience(contact_id=contact_id, email=email, phone=phone_number, practice_name=practice_name, analysis=analysis)
+                    else:
+                        print(f"[LGM] Skipping — conversion likelihood: {analysis.get('conversion_likelihood')}")
                     print(f"[HUBSPOT] ✅ Sync complete for contact {contact_id}")
         
     except Exception as e:
@@ -590,19 +598,104 @@ Be specific and accurate. Only include information actually present in the trans
             "summary": f"Error analyzing call: {str(e)}"
         }
 
+def get_email_for_phone(phone_number: str) -> str:
+    """
+    Look up the email we verified during lead generation from Supabase pending_leads.
+    Falls back to empty string if not found.
+    """
+    try:
+        # Normalize phone for lookup
+        digits = ''.join(c for c in phone_number if c.isdigit())
+        result = supabase.table("pending_leads").select("email, email_valid").or_(
+            f"phone.eq.{phone_number},phone.eq.+{digits},phone.eq.+1{digits[-10:]}"
+        ).limit(1).execute()
+        if result.data and result.data[0].get("email_valid"):
+            return result.data[0]["email"]
+    except Exception as e:
+        print(f"[SUPABASE] Could not fetch email for {phone_number}: {e}")
+    return ""
+
+
+def enroll_in_lgm_audience(contact_id: str, email: str, phone: str, practice_name: str, analysis: dict):
+    """
+    1. Sets lgm_ready = true on HubSpot contact (for tracking)
+    2. Directly pushes lead to LGM audience via API (no HubSpot workflow needed)
+    """
+    import requests as req
+
+    likelihood    = analysis.get("conversion_likelihood", "low")
+    practice_type = analysis.get("practice_type", "unknown")
+
+    # Step 1: Update HubSpot contact
+    if hubspot_client:
+        try:
+            hubspot_client.crm.contacts.basic_api.update(
+                contact_id=contact_id,
+                simple_public_object_input={
+                    "properties": {
+                        "lgm_ready":             "true",
+                        "lgm_enrolled_date":     datetime.now().strftime("%Y-%m-%d"),
+                        "last_call_disposition": likelihood,
+                        "practice_vertical":     practice_type,
+                        "call_next_steps":       analysis.get("next_steps", ""),
+                        "call_summary":          analysis.get("summary", ""),
+                    }
+                }
+            )
+            print(f"[LGM] HubSpot contact {contact_id} flagged lgm_ready=true")
+        except Exception as e:
+            print(f"[LGM] HubSpot update failed: {e}")
+
+    # Step 2: Push directly to LGM audience via API
+    if not LGM_API_KEY or not LGM_AUDIENCE_ID:
+        print("[LGM] Skipping LGM push - LGM_API_KEY or LGM_AUDIENCE_ID not set")
+        return
+
+    slug = practice_name.lower().replace(" ", "-").replace("'", "")[:40] if practice_name else "unknown"
+    linkedin_placeholder = f"https://www.linkedin.com/company/{slug}"
+
+    try:
+        resp = req.post(
+            "https://apiv2.lagrowthmachine.com/flow/leads",
+            params={"apikey": LGM_API_KEY},
+            json={
+                "audience":    LGM_AUDIENCE_ID,
+                "firstname":   practice_name or "Unknown",
+                "lastname":    "Practice",
+                "linkedinUrl": linkedin_placeholder,
+                "phone":       phone,
+                "companyName": practice_name or "Unknown Practice",
+            },
+            timeout=15
+        )
+        data = resp.json()
+        if resp.status_code == 200:
+            print(f"[LGM] Lead pushed to LGM audience - {data.get('message', 'OK')}")
+        else:
+            print(f"[LGM] LGM push failed: {resp.status_code} {data}")
+    except Exception as e:
+        print(f"[LGM] LGM API error: {e}")
+
+
 def create_or_update_hubspot_contact(phone_number: str, practice_name: str, caller_name: str, analysis: dict, call_sid: str, recording_url: str):
     if not hubspot_client:
         print("[HUBSPOT] Skipping - no API key configured")
         return {"action": "skipped"}
-    
+
+    # Pull verified email from Supabase if available
+    email = get_email_for_phone(phone_number)
+
     try:
         properties = {
-            "phone": phone_number,
-            "company": practice_name or "Unknown Practice",
+            "phone":          phone_number,
+            "company":        practice_name or "Unknown Practice",
             "lifecyclestage": "lead",
             "hs_lead_status": "OPEN",
         }
-        
+        if email:
+            properties["email"] = email
+            print(f"[HUBSPOT] Enriching with verified email: {email}")
+
         try:
             search_results = hubspot_client.crm.contacts.search_api.do_search(
                 public_object_search_request={
@@ -615,7 +708,7 @@ def create_or_update_hubspot_contact(phone_number: str, practice_name: str, call
                     }]
                 }
             )
-            
+
             if search_results.total > 0:
                 contact_id = search_results.results[0].id
                 hubspot_client.crm.contacts.basic_api.update(
@@ -631,11 +724,11 @@ def create_or_update_hubspot_contact(phone_number: str, practice_name: str, call
                 )
                 print(f"[HUBSPOT] ✅ Created contact: {created_contact.id}")
                 return {"action": "created", "contact_id": created_contact.id}
-                
+
         except HubSpotApiException as e:
             print(f"[HUBSPOT] ⚠️ Search/create error: {e}")
             return {"action": "failed", "error": str(e)}
-            
+
     except Exception as e:
         print(f"[HUBSPOT] ❌ Error: {str(e)}")
         return {"action": "failed", "error": str(e)}

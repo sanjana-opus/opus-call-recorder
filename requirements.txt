@@ -8,3 +8,4 @@ supabase==2.9.1
 hubspot-api-client==9.0.0
 openai==1.54.0
 setuptools
+requests==2.32.3
