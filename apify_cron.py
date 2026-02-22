@@ -1,27 +1,27 @@
 """
 apify_cron.py
 -------------
-Runs at 7:00 AM every weekday (schedule this via Railway cron or system cron).
+Runs at 7:00 AM CST every weekday via Railway cron.
 
 Flow:
-  1. Call Apify actor to scrape 50 quality leads (dental/medspa/weight loss in TX + MA)
-  2. Verify email via ZeroBounce + phone via Abstract API
-  3. Deduplicate against HubSpot (skip if contact already exists)
-  4. Send Carolina a Slack digest + email digest with the day's leads
-  5. Each lead stored in Supabase `pending_leads` table for tracking
+  1. Apify scrapes leads (dental/medspa/weight loss in TX + MA)
+  2. Hunter.io enriches email from practice website domain
+  3. Deduplicate against HubSpot (skip existing contacts)
+  4. Send Carolina email digest with the day's leads
+  5. Store leads in Supabase pending_leads table
 
-Env vars needed (add to Railway):
+Env vars needed in Railway:
   APIFY_API_TOKEN
-  APIFY_ACTOR_ID          # your dental/medspa/weight loss scraper actor
-  ZEROBOUNCE_API_KEY
-  ABSTRACT_API_KEY
+  APIFY_ACTOR_ID          # compass~crawler-google-places
+  HUNTER_API_KEY
   HUBSPOT_API_KEY
-  SLACK_BOT_TOKEN
-  SLACK_CHANNEL_ID        # Carolina's DM channel or #leads channel
+  GMAIL_USER              # sanjana@emberluna.co
+  GMAIL_APP_PASSWORD
   CAROLINA_EMAIL          # carolina@opushealth.io
-  SENDGRID_API_KEY        # or use SMTP
   SUPABASE_URL
   SUPABASE_KEY
+  LGM_API_KEY
+  LGM_AUDIENCE_ID
 """
 
 import os
