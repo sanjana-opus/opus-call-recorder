@@ -347,6 +347,7 @@ async def start_call(request: Request):
             status_callback=f"{base_url}/call-status",
             status_callback_event=['completed'],
             record=True,
+            recording_channels="dual",            # separate channel per leg: 0=rep, 1=practice
             recording_status_callback=f"{base_url}/recording-ready"
         )
         
@@ -442,7 +443,7 @@ async def recording_ready(request: Request):
         options = PrerecordedOptions(
             model="nova-3",
             smart_format=True,
-            diarize=True,
+            multichannel=True,   # dual-channel: channel 0 = rep, channel 1 = practice
             punctuate=True,
             utterances=True,
         )
@@ -453,27 +454,83 @@ async def recording_ready(request: Request):
         )
         
         response_dict = response.to_dict()
-        utterances = response_dict.get("results", {}).get("utterances", [])
-        plain_transcript = response_dict["results"]["channels"][0]["alternatives"][0]["transcript"]
 
-        if utterances:
-            # Identify the sales rep as the speaker who talks first.
-            # The Twilio whisper ("Connecting you to the practice now") always
-            # comes first on the rep side, so first_speaker = rep.
-            first_speaker = utterances[0].get("speaker", 0)
+        # ── Dual-channel transcript assembly ────────────────────────────────
+        # Twilio dual-channel: channel 0 = outbound leg (rep), channel 1 = inbound leg (practice).
+        # Each channel has its own alternatives list. We interleave by word start_time
+        # so the final transcript reads in chronological order.
+        channels = response_dict.get("results", {}).get("channels", [])
+
+        # Build plain transcript from channel 0 for OpenAI analysis (rep+practice merged)
+        all_words_plain = []
+        for ch_idx, ch in enumerate(channels):
+            alts = ch.get("alternatives", [])
+            if alts:
+                for w in alts[0].get("words", []):
+                    all_words_plain.append((w.get("start", 0), w.get("word", "")))
+        all_words_plain.sort(key=lambda x: x[0])
+        plain_transcript = " ".join(w for _, w in all_words_plain)
+
+        # Build diarized transcript by interleaving utterances from both channels
+        # Each utterance tagged with its channel so speaker label is deterministic
+        all_utterances = []
+        for ch_idx, ch in enumerate(channels):
+            alts = ch.get("alternatives", [])
+            if alts:
+                for utt in alts[0].get("paragraphs", {}).get("paragraphs", []):
+                    for sentence in utt.get("sentences", []):
+                        all_utterances.append({
+                            "channel": ch_idx,
+                            "start": sentence.get("start", 0),
+                            "text": sentence.get("text", "").strip()
+                        })
+
+        # Fallback: if paragraphs/sentences not available, use top-level words grouped by channel
+        if not all_utterances:
+            for ch_idx, ch in enumerate(channels):
+                alts = ch.get("alternatives", [])
+                if alts and alts[0].get("transcript"):
+                    # Use the whole channel transcript as one block, timed at 0 offset per channel
+                    # We'll interleave by checking utterances from response root
+                    pass
+
+            # Last resort: use root-level utterances with channel field
+            root_utterances = response_dict.get("results", {}).get("utterances", [])
+            for utt in root_utterances:
+                all_utterances.append({
+                    "channel": utt.get("channel", 0),
+                    "start": utt.get("start", 0),
+                    "text": utt.get("transcript", "").strip()
+                })
+
+        # Sort all utterances chronologically
+        all_utterances.sort(key=lambda x: x["start"])
+
+        # Filter out the Twilio whisper ("Connecting you to the practice now")
+        # which appears at the very start and is system-generated noise
+        WHISPER_PHRASES = ["connecting you to the practice", "connecting you now"]
+        all_utterances = [
+            u for u in all_utterances
+            if not any(w in u["text"].lower() for w in WHISPER_PHRASES)
+        ]
+
+        if all_utterances:
             formatted_lines = []
-            for utt in utterances:
-                speaker_num = utt.get("speaker", 0)
-                text = utt.get("transcript", "").strip()
+            for utt in all_utterances:
+                text = utt["text"]
                 if not text:
                     continue
-                speaker_label = "**You:**" if speaker_num == first_speaker else "**Practice:**"
+                # Channel 0 = rep (outbound), Channel 1 = practice (inbound)
+                speaker_label = "**You:**" if utt["channel"] == 0 else "**Practice:**"
                 formatted_lines.append(f"{speaker_label} {text}")
             transcript = "\n\n".join(formatted_lines)
-            print(f"[RECORDING-READY] ✅ Diarization: {len(utterances)} utterances, rep=Speaker {first_speaker}")
+            rep_count = sum(1 for u in all_utterances if u["channel"] == 0)
+            prac_count = sum(1 for u in all_utterances if u["channel"] == 1)
+            print(f"[RECORDING-READY] ✅ Dual-channel diarization: {rep_count} rep utterances, {prac_count} practice utterances")
         else:
             transcript = plain_transcript
-            print(f"[RECORDING-READY] ⚠️ No utterances, using plain transcript")
+            print(f"[RECORDING-READY] ⚠️ No utterances found, using plain transcript")
+
         
         print(f"[RECORDING-READY] Transcript received: {len(transcript)} characters")
         
@@ -1093,6 +1150,70 @@ async def view_call(call_sid: str):
     </body>
     </html>
     """
+
+@app.post("/test/hubspot-lgm")
+async def test_hubspot_lgm():
+    """
+    Fire a fake completed call through the full HubSpot + LGM pipeline.
+    Use this to verify field mapping without making a real call.
+    DELETE this contact from HubSpot after verifying.
+    """
+    fake_analysis = {
+        "practice_name": "Test Dental Co",
+        "contact_name": "Hope",
+        "contact_title": "Office Manager",
+        "practice_type": "dental",
+        "pain_points": ["manual HSA paperwork", "patients unaware of HSA/FSA benefits"],
+        "objections": ["need to talk to manager"],
+        "value_props_resonated": ["automated billing", "increased average payments by 124%"],
+        "next_steps": "Send email to test@testdentalco.com",
+        "callback_name": "Hope",
+        "callback_extension": None,
+        "email_mentioned": "test@testdentalco.com",
+        "conversion_likelihood": "medium",
+        "key_quotes": ["We deal with that a lot", "Sure, send us the info"],
+        "summary": "TEST RECORD - Spoke with Hope, office manager. Interested but needs manager approval. Requested email follow-up."
+    }
+
+    fake_phone = "+10000000001"
+    fake_call_sid = f"TEST_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+    print(f"[TEST] Starting test pipeline with call_sid={fake_call_sid}")
+
+    result = create_or_update_hubspot_contact(
+        phone_number=fake_phone,
+        practice_name="Test Dental Co",
+        caller_name="Sanjana",
+        analysis=fake_analysis,
+        call_sid=fake_call_sid,
+        recording_url="https://example.com/test-recording.mp3"
+    )
+
+    if result.get("action") in ["created", "updated"]:
+        contact_id = result["contact_id"]
+        pipeline_result = add_contact_to_sales_pipeline(contact_id, fake_analysis)
+        note_result = add_hubspot_note(contact_id, fake_analysis, "https://example.com/test.mp3", fake_call_sid)
+        enroll_in_lgm_audience(
+            contact_id=contact_id,
+            email="test@testdentalco.com",
+            phone=fake_phone,
+            practice_name="Test Dental Co",
+            analysis=fake_analysis
+        )
+        return {
+            "status": "✅ Test complete",
+            "hubspot": result,
+            "pipeline": pipeline_result,
+            "note": note_result,
+            "check": {
+                "hubspot_contact_id": contact_id,
+                "verify_fields": ["firstname", "lastname", "sales_lead_type", "lgm_ready", "contact_type"],
+                "lgm_audience": LGM_AUDIENCE_ID
+            }
+        }
+    else:
+        return {"status": "❌ HubSpot contact creation failed", "result": result}
+
 
 if __name__ == "__main__":
     import uvicorn
