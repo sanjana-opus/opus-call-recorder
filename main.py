@@ -440,7 +440,7 @@ async def recording_ready(request: Request):
         print("[RECORDING-READY] Starting Deepgram transcription with diarization...")
         
         options = PrerecordedOptions(
-            model="nova-2",
+            model="nova-3",
             smart_format=True,
             diarize=True,
             punctuate=True,
@@ -452,26 +452,28 @@ async def recording_ready(request: Request):
             options
         )
         
-        # Convert response to dict
         response_dict = response.to_dict()
-        
         utterances = response_dict.get("results", {}).get("utterances", [])
-        
+        plain_transcript = response_dict["results"]["channels"][0]["alternatives"][0]["transcript"]
+
         if utterances:
+            # Identify the sales rep as the speaker who talks first.
+            # The Twilio whisper ("Connecting you to the practice now") always
+            # comes first on the rep side, so first_speaker = rep.
+            first_speaker = utterances[0].get("speaker", 0)
             formatted_lines = []
             for utt in utterances:
                 speaker_num = utt.get("speaker", 0)
-                text = utt.get("transcript", "")
-                speaker_label = "**You:**" if speaker_num == 0 else "**Practice:**"
+                text = utt.get("transcript", "").strip()
+                if not text:
+                    continue
+                speaker_label = "**You:**" if speaker_num == first_speaker else "**Practice:**"
                 formatted_lines.append(f"{speaker_label} {text}")
-            
             transcript = "\n\n".join(formatted_lines)
-            print(f"[RECORDING-READY] ✅ Used speaker diarization ({len(utterances)} utterances)")
+            print(f"[RECORDING-READY] ✅ Diarization: {len(utterances)} utterances, rep=Speaker {first_speaker}")
         else:
-            transcript = response_dict["results"]["channels"][0]["alternatives"][0]["transcript"]
-            print(f"[RECORDING-READY] ⚠️ Diarization not available, using plain transcript")
-        
-        plain_transcript = response_dict["results"]["channels"][0]["alternatives"][0]["transcript"]
+            transcript = plain_transcript
+            print(f"[RECORDING-READY] ⚠️ No utterances, using plain transcript")
         
         print(f"[RECORDING-READY] Transcript received: {len(transcript)} characters")
         
@@ -549,27 +551,34 @@ async def recording_ready(request: Request):
     return {"status": "processed"}
 
 def analyze_sales_call(transcript: str) -> dict:
-    prompt = f"""Analyze this B2B sales call transcript for Opus Health (a healthcare payments platform that helps practices with HSA/FSA billing).
+    prompt = f"""You are analyzing a B2B outbound sales call for Opus Health — a healthcare payments platform that automates HSA/FSA billing for dental practices, med spas, and weight loss clinics.
 
-The call is between a sales representative from Opus Health and a dental/medical practice.
+The call is between an Opus Health sales rep and a front desk / office manager at a practice.
+
+IMPORTANT: The transcript may have imperfect speaker labels due to automated diarization. Use context clues — the rep introduces themselves, mentions Opus Health, and pitches the product. The practice side answers the phone, gives their name, and responds to the pitch.
 
 Transcript:
 {transcript}
 
-Carefully extract the following information. If something is not mentioned or unclear, use "Not mentioned" or "Unknown" rather than making assumptions.
+Extract the following. Be specific — use exact names, numbers, and phrases from the transcript. If something is genuinely not mentioned, use null (not "Not mentioned").
 
-Return your analysis as a JSON object with these exact fields:
-- practice_name: The actual name of the practice if mentioned, or 'Not mentioned'
-- practice_type: dental/weight loss/medical/veterinary/other
-- pain_points: Array of specific problems mentioned
-- objections: Array of concerns or reasons for hesitation
-- value_props_resonated: Array of Opus Health benefits that interested them
-- next_steps: Specific actions agreed upon
-- conversion_likelihood: high/medium/low/none
-- key_quotes: Array of 1-3 notable quotes from the practice
-- summary: 2-3 sentence summary of the call
-
-Be specific and accurate. Only include information actually present in the transcript."""
+Return ONLY a valid JSON object with these exact fields:
+{{
+  "practice_name": "exact practice name said in call, or null",
+  "contact_name": "first name of the person who answered, or null",
+  "contact_title": "their title/role if mentioned, or null",
+  "practice_type": "dental | medspa | weight_loss | other",
+  "pain_points": ["array of specific problems or needs they mentioned"],
+  "objections": ["array of reasons they hesitated or said no"],
+  "value_props_resonated": ["which Opus Health benefits got a positive response"],
+  "next_steps": "single string — exact next action e.g. 'Manager Hope calls back, ext 2001' or 'Send email to bearcreekfamilydentistry@yahoo.com'",
+  "callback_name": "name of person to call back if mentioned, or null",
+  "callback_extension": "phone extension if mentioned, or null",
+  "email_mentioned": "email address spoken in the call if any, or null",
+  "conversion_likelihood": "high | medium | low | none",
+  "key_quotes": ["1-3 direct quotes from the practice side only"],
+  "summary": "2-3 sentences covering what happened, who was spoken to, and what was agreed"
+}}"""
     
     try:
         response = openai_client.chat.completions.create(
@@ -655,28 +664,31 @@ def enroll_in_lgm_audience(contact_id: str, email: str, phone: str, practice_nam
         print("[LGM] Skipping LGM push - LGM_API_KEY or LGM_AUDIENCE_ID not set")
         return
 
-    slug = practice_name.lower().replace(" ", "-").replace("'", "")[:40] if practice_name else "unknown"
-    linkedin_placeholder = f"https://www.linkedin.com/company/{slug}"
+    lgm_payload = {
+        "audience":    LGM_AUDIENCE_ID,
+        "firstname":   practice_name or "Unknown Practice",
+        "lastname":    "Practice",
+        "phone":       phone,
+        "companyName": practice_name or "Unknown Practice",
+    }
+    if email and "@" in email:
+        lgm_payload["email"] = email
+
+    print(f"[LGM] Payload: {lgm_payload}")
 
     try:
         resp = req.post(
             "https://apiv2.lagrowthmachine.com/flow/leads",
             params={"apikey": LGM_API_KEY},
-            json={
-                "audience":    LGM_AUDIENCE_ID,
-                "firstname":   practice_name or "Unknown",
-                "lastname":    "Practice",
-                "linkedinUrl": linkedin_placeholder,
-                "phone":       phone,
-                "companyName": practice_name or "Unknown Practice",
-            },
+            json=lgm_payload,
             timeout=15
         )
+        print(f"[LGM] Response {resp.status_code}: {resp.text}")
         data = resp.json()
         if resp.status_code == 200:
-            print(f"[LGM] Lead pushed to LGM audience - {data.get('message', 'OK')}")
+            print(f"[LGM] ✅ Lead pushed successfully - {data.get('message', 'OK')}")
         else:
-            print(f"[LGM] LGM push failed: {resp.status_code} {data}")
+            print(f"[LGM] ❌ Push failed: {resp.status_code} {data}")
     except Exception as e:
         print(f"[LGM] LGM API error: {e}")
 
@@ -686,34 +698,70 @@ def create_or_update_hubspot_contact(phone_number: str, practice_name: str, call
         print("[HUBSPOT] Skipping - no API key configured")
         return {"action": "skipped"}
 
+    # Pull enriched email from Supabase pending_leads
     email = get_email_for_phone(phone_number)
+    # Also check if OpenAI extracted an email from the call itself
+    if not email:
+        email = analysis.get("email_mentioned") or ""
+
+    # Resolve best practice name: UI input > analysis extraction
+    resolved_name = practice_name or ""
+    analysis_name = analysis.get("practice_name") or ""
+    if analysis_name and analysis_name not in ("Not mentioned", "Unknown", "null", ""):
+        resolved_name = analysis_name
+
+    # Build contact name from what was said in the call
+    contact_first = analysis.get("contact_name") or resolved_name or "Unknown"
+    contact_last  = "Practice"
+
+    # Map practice_type to our custom property values
+    practice_type = analysis.get("practice_type", "other")
+
+    # next_steps can be string or list
+    next_steps_raw = analysis.get("next_steps", "")
+    next_steps = next_steps_raw if isinstance(next_steps_raw, str) else "; ".join(next_steps_raw)
 
     properties = {
-        "phone":          phone_number,
-        "company":        practice_name or "Unknown Practice",
-        "lifecyclestage": "lead",
-        "hs_lead_status": "OPEN",
+        "phone":                 phone_number,
+        "firstname":             contact_first,
+        "lastname":              contact_last,
+        "company":               resolved_name or "Unknown Practice",
+        "lifecyclestage":        "lead",
+        "hs_lead_status":        "OPEN",
+        "practice_vertical":     practice_type,
+        "last_call_disposition": analysis.get("conversion_likelihood", ""),
+        "call_summary":          analysis.get("summary", ""),
+        "call_next_steps":       next_steps,
     }
     if email:
         properties["email"] = email
-        print(f"[HUBSPOT] Enriching with verified email: {email}")
+        print(f"[HUBSPOT] Email: {email}")
+
+    print(f"[HUBSPOT] Writing: name={resolved_name}, contact={contact_first}, type={practice_type}, likelihood={analysis.get('conversion_likelihood')}")
 
     try:
-        # Search for existing contact by phone
+        # Search by phone
         search = hs("POST", "/crm/v3/objects/contacts/search", json={
             "filterGroups": [{"filters": [{"propertyName": "phone", "operator": "EQ", "value": phone_number}]}]
         })
         results = search.get("results", [])
 
+        # If not found by phone, try email
+        if not results and email:
+            search2 = hs("POST", "/crm/v3/objects/contacts/search", json={
+                "filterGroups": [{"filters": [{"propertyName": "email", "operator": "EQ", "value": email}]}]
+            })
+            results = search2.get("results", [])
+
         if results:
             contact_id = results[0]["id"]
             hs("PATCH", f"/crm/v3/objects/contacts/{contact_id}", json={"properties": properties})
-            print(f"[HUBSPOT] ✅ Updated contact: {contact_id}")
+            print(f"[HUBSPOT] ✅ Updated contact {contact_id}")
             return {"action": "updated", "contact_id": contact_id}
         else:
             created = hs("POST", "/crm/v3/objects/contacts", json={"properties": properties})
             contact_id = created["id"]
-            print(f"[HUBSPOT] ✅ Created contact: {contact_id}")
+            print(f"[HUBSPOT] ✅ Created contact {contact_id}")
             return {"action": "created", "contact_id": contact_id}
 
     except Exception as e:
