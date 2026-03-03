@@ -667,12 +667,12 @@ def enroll_in_lgm_audience(contact_id: str, email: str, phone: str, practice_nam
     lgm_payload = {
         "audience":    LGM_AUDIENCE_ID,
         "firstname":   practice_name or "Unknown Practice",
-        "lastname":    "Practice",
+        "lastname":    "",
         "phone":       phone,
         "companyName": practice_name or "Unknown Practice",
     }
     if email and "@" in email:
-        lgm_payload["email"] = email
+        lgm_payload["pro_email"] = email   # LGM requires pro_email, not email
 
     print(f"[LGM] Payload: {lgm_payload}")
 
@@ -711,11 +711,23 @@ def create_or_update_hubspot_contact(phone_number: str, practice_name: str, call
         resolved_name = analysis_name
 
     # Build contact name from what was said in the call
-    contact_first = analysis.get("contact_name") or resolved_name or "Unknown"
-    contact_last  = "Practice"
+    # If we have a real person's name from the call, use firstname only, blank lastname
+    # If no contact name found, fall back to practice name in firstname, blank lastname
+    raw_contact = analysis.get("contact_name") or ""
+    contact_first = raw_contact if raw_contact else (resolved_name or "Unknown")
+    contact_last  = ""  # Never set to "Practice" — avoids "Hi Practice," in LGM sequences
 
     # Map practice_type to our custom property values
     practice_type = analysis.get("practice_type", "other")
+
+    # Map practice_type → sales_lead_type display label
+    lead_type_map = {
+        "dental":      "Dental Practice",
+        "medspa":      "Med Spa",
+        "weight_loss": "Weight Loss Clinic",
+        "other":       "Other",
+    }
+    sales_lead_type = lead_type_map.get(practice_type, "Dental Practice")
 
     # next_steps can be string or list
     next_steps_raw = analysis.get("next_steps", "")
@@ -728,6 +740,9 @@ def create_or_update_hubspot_contact(phone_number: str, practice_name: str, call
         "company":               resolved_name or "Unknown Practice",
         "lifecyclestage":        "lead",
         "hs_lead_status":        "OPEN",
+        "contact_type":          "Lead",
+        "sales_lead_type":       sales_lead_type,
+        "lgm_ready":             "No",        # default NO — only flipped to Yes on LGM enrollment
         "practice_vertical":     practice_type,
         "last_call_disposition": analysis.get("conversion_likelihood", ""),
         "call_summary":          analysis.get("summary", ""),
