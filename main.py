@@ -752,14 +752,6 @@ def enroll_in_lgm_audience(contact_id: str, email: str, phone: str, practice_nam
         "lastname":    lgm_lastname,
         "phone":       phone,
         "companyName": practice_name or "Unknown Practice",
-        # Custom attributes — available as {{custom.X}} in LGM sequences
-        "customAttributes": {
-            "practice_name":     practice_name or "",
-            "practice_type":     analysis.get("practice_type", ""),
-            "next_steps":        str(analysis.get("next_steps", "")),
-            "call_summary":      analysis.get("summary", ""),
-            "conversion_likelihood": analysis.get("conversion_likelihood", ""),
-        }
     }
     if email and "@" in email:
         lgm_payload["pro_email"] = email   # LGM requires pro_email, not perso_email
