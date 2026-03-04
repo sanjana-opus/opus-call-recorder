@@ -507,18 +507,36 @@ async def recording_ready(request: Request):
         # Sort all utterances chronologically
         all_utterances.sort(key=lambda x: x["start"])
 
-        # Filter out the Twilio whisper ("Connecting you to the practice now")
-        # which appears at the very start and is system-generated noise
-        WHISPER_PHRASES = ["connecting you to the practice", "connecting you now"]
+        # Filter out Twilio system audio — whisper + any very short noise utterances
+        WHISPER_PHRASES = ["connecting you to the practice", "connecting you now", "please hold"]
         all_utterances = [
             u for u in all_utterances
-            if not any(w in u["text"].lower() for w in WHISPER_PHRASES)
+            if len(u["text"].strip()) > 2  # drop single-word noise like "Okay." at t=0
+            and not any(w in u["text"].lower() for w in WHISPER_PHRASES)
         ]
+
+        # Merge consecutive utterances from same channel that are within 1.5s of each other
+        # This groups short back-to-back sentences into natural speaking turns
+        merged = []
+        for utt in all_utterances:
+            if (merged
+                and merged[-1]["channel"] == utt["channel"]
+                and (utt["start"] - merged[-1]["end"]) < 1.5):
+                merged[-1]["text"] += " " + utt["text"]
+                merged[-1]["end"]   = utt.get("end", utt["start"])
+            else:
+                merged.append({
+                    "channel": utt["channel"],
+                    "start":   utt["start"],
+                    "end":     utt.get("end", utt["start"]),
+                    "text":    utt["text"]
+                })
+        all_utterances = merged
 
         if all_utterances:
             formatted_lines = []
             for utt in all_utterances:
-                text = utt["text"]
+                text = utt["text"].strip()
                 if not text:
                     continue
                 # Channel 0 = rep (outbound), Channel 1 = practice (inbound)
@@ -527,7 +545,7 @@ async def recording_ready(request: Request):
             transcript = "\n".join(formatted_lines)
             rep_count = sum(1 for u in all_utterances if u["channel"] == 0)
             prac_count = sum(1 for u in all_utterances if u["channel"] == 1)
-            print(f"[RECORDING-READY] ✅ Dual-channel diarization: {rep_count} rep utterances, {prac_count} practice utterances")
+            print(f"[RECORDING-READY] ✅ Dual-channel diarization: {rep_count} rep turns, {prac_count} practice turns (after merge)")
         else:
             transcript = plain_transcript
             print(f"[RECORDING-READY] ⚠️ No utterances found, using plain transcript")
@@ -851,8 +869,11 @@ def create_or_update_hubspot_contact(phone_number: str, practice_name: str, call
     sales_lead_type = lead_type_map.get(practice_type, "Dental Practice")
 
     # next_steps can be string or list
-    next_steps_raw = analysis.get("next_steps", "")
-    next_steps = next_steps_raw if isinstance(next_steps_raw, str) else "; ".join(next_steps_raw)
+    next_steps_raw = analysis.get("next_steps") or ""
+    if isinstance(next_steps_raw, list):
+        next_steps = "; ".join(str(x) for x in next_steps_raw if x)
+    else:
+        next_steps = str(next_steps_raw) if next_steps_raw else ""
 
     properties = {
         "phone":                 phone_number,
