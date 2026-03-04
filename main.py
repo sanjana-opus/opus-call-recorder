@@ -754,7 +754,7 @@ def enroll_in_lgm_audience(contact_id: str, email: str, phone: str, practice_nam
         "companyName": practice_name or "Unknown Practice",
     }
     if email and "@" in email:
-        lgm_payload["pro_email"] = email   # LGM requires pro_email, not perso_email
+        lgm_payload["email"] = email
 
     print(f"[LGM] Payload: {lgm_payload}")
 
