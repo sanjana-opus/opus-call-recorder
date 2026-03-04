@@ -63,6 +63,7 @@ async def lifespan(app: FastAPI):
         try:
             hs("GET", "/crm/v3/objects/contacts?limit=1")
             print("[STARTUP] ✅ HubSpot connected")
+            ensure_hubspot_custom_properties()
         except Exception as e:
             print(f"[STARTUP] ⚠️ HubSpot connection failed: {e}")
     
@@ -521,9 +522,9 @@ async def recording_ready(request: Request):
                 if not text:
                     continue
                 # Channel 0 = rep (outbound), Channel 1 = practice (inbound)
-                speaker_label = "**You:**" if utt["channel"] == 0 else "**Practice:**"
+                speaker_label = "Rep:" if utt["channel"] == 0 else "Practice:"
                 formatted_lines.append(f"{speaker_label} {text}")
-            transcript = "\n\n".join(formatted_lines)
+            transcript = "\n".join(formatted_lines)
             rep_count = sum(1 for u in all_utterances if u["channel"] == 0)
             prac_count = sum(1 for u in all_utterances if u["channel"] == 1)
             print(f"[RECORDING-READY] ✅ Dual-channel diarization: {rep_count} rep utterances, {prac_count} practice utterances")
@@ -721,15 +722,29 @@ def enroll_in_lgm_audience(contact_id: str, email: str, phone: str, practice_nam
         print("[LGM] Skipping LGM push - LGM_API_KEY or LGM_AUDIENCE_ID not set")
         return
 
+    # Build firstname: use real contact name from call if available,
+    # fall back to practice name so {{firstname}} is never blank in sequences
+    contact_name = analysis.get("contact_name") or ""
+    lgm_firstname = contact_name if contact_name and contact_name.lower() not in ("null", "unknown", "") else (practice_name or "there")
+    lgm_lastname  = ""  # always blank — avoids "Hi Practice," in sequences
+
     lgm_payload = {
         "audience":    LGM_AUDIENCE_ID,
-        "firstname":   practice_name or "Unknown Practice",
-        "lastname":    "",
+        "firstname":   lgm_firstname,
+        "lastname":    lgm_lastname,
         "phone":       phone,
         "companyName": practice_name or "Unknown Practice",
+        # Custom attributes — available as {{custom.X}} in LGM sequences
+        "customAttributes": {
+            "practice_name":     practice_name or "",
+            "practice_type":     analysis.get("practice_type", ""),
+            "next_steps":        str(analysis.get("next_steps", "")),
+            "call_summary":      analysis.get("summary", ""),
+            "conversion_likelihood": analysis.get("conversion_likelihood", ""),
+        }
     }
     if email and "@" in email:
-        lgm_payload["pro_email"] = email   # LGM requires pro_email, not email
+        lgm_payload["pro_email"] = email   # LGM requires pro_email, not perso_email
 
     print(f"[LGM] Payload: {lgm_payload}")
 
@@ -748,6 +763,55 @@ def enroll_in_lgm_audience(contact_id: str, email: str, phone: str, practice_nam
             print(f"[LGM] ❌ Push failed: {resp.status_code} {data}")
     except Exception as e:
         print(f"[LGM] LGM API error: {e}")
+
+
+def ensure_hubspot_custom_properties():
+    """
+    Idempotently creates all custom contact properties Opus Health needs.
+    Safe to call on every deploy — HubSpot ignores duplicates (409 = already exists).
+    """
+    custom_props = [
+        {"name": "sales_lead_type", "label": "Sales - Lead Type", "type": "enumeration", "fieldType": "select",
+         "options": [
+             {"label": "Dental Practice",    "value": "Dental Practice",    "displayOrder": 0, "hidden": False},
+             {"label": "Med Spa",            "value": "Med Spa",            "displayOrder": 1, "hidden": False},
+             {"label": "Weight Loss Clinic", "value": "Weight Loss Clinic", "displayOrder": 2, "hidden": False},
+             {"label": "Other",              "value": "Other",              "displayOrder": 3, "hidden": False},
+         ]},
+        {"name": "lgm_ready",             "label": "LGM Ready",            "type": "enumeration", "fieldType": "select",
+         "options": [
+             {"label": "Yes", "value": "Yes", "displayOrder": 0, "hidden": False},
+             {"label": "No",  "value": "No",  "displayOrder": 1, "hidden": False},
+         ]},
+        {"name": "practice_vertical",     "label": "Practice Vertical",    "type": "string", "fieldType": "text"},
+        {"name": "last_call_disposition", "label": "Last Call Disposition", "type": "string", "fieldType": "text"},
+        {"name": "call_summary",          "label": "Call Summary",         "type": "string", "fieldType": "textarea"},
+        {"name": "call_next_steps",       "label": "Call Next Steps",      "type": "string", "fieldType": "textarea"},
+        {"name": "lgm_enrolled_date",     "label": "LGM Enrolled Date",    "type": "string", "fieldType": "text"},
+    ]
+
+    created, skipped, failed = [], [], []
+    for prop in custom_props:
+        payload = {
+            "name":      prop["name"],
+            "label":     prop["label"],
+            "type":      prop["type"],
+            "fieldType": prop["fieldType"],
+            "groupName": "contactinformation",
+        }
+        if "options" in prop:
+            payload["options"] = prop["options"]
+        try:
+            hs("POST", "/crm/v3/properties/contacts", json=payload)
+            created.append(prop["name"])
+        except Exception as e:
+            if "409" in str(e) or "already exists" in str(e).lower():
+                skipped.append(prop["name"])
+            else:
+                failed.append(f"{prop['name']}: {e}")
+
+    print(f"[HUBSPOT] Properties — created: {created}, already existed: {skipped}, failed: {failed}")
+    return {"created": created, "skipped": skipped, "failed": failed}
 
 
 def create_or_update_hubspot_contact(phone_number: str, practice_name: str, caller_name: str, analysis: dict, call_sid: str, recording_url: str):
@@ -837,8 +901,15 @@ def create_or_update_hubspot_contact(phone_number: str, practice_name: str, call
             return {"action": "created", "contact_id": contact_id}
 
     except Exception as e:
-        print(f"[HUBSPOT] ❌ Error: {str(e)}")
-        return {"action": "failed", "error": str(e)}
+        err_msg = str(e)
+        try:
+            if hasattr(e, 'response') and e.response is not None:
+                err_body = e.response.json()
+                err_msg = f"{e} | detail: {err_body}"
+        except Exception:
+            pass
+        print(f"[HUBSPOT] ❌ Error: {err_msg}")
+        return {"action": "failed", "error": err_msg}
 
 def add_contact_to_sales_pipeline(contact_id: str, analysis: dict):
     if not HUBSPOT_API_KEY:
@@ -1075,9 +1146,38 @@ async def view_call(call_sid: str):
             .low {{ background: #f8d7da; color: #721c24; }}
             ul {{ line-height: 1.8; }}
             .transcript {{
-                white-space: pre-wrap;
-                line-height: 1.8;
+                display: flex;
+                flex-direction: column;
+                gap: 8px;
+            }}
+            .utterance {{
+                display: flex;
+                align-items: baseline;
+                gap: 10px;
+                padding: 8px 12px;
+                border-radius: 8px;
+                line-height: 1.5;
+            }}
+            .utterance.rep {{
+                background: #eef2ff;
+                border-left: 3px solid #667eea;
+            }}
+            .utterance.practice {{
+                background: #f0fdf4;
+                border-left: 3px solid #43cea2;
+            }}
+            .speaker-label {{
+                font-size: 11px;
+                font-weight: 700;
+                text-transform: uppercase;
+                letter-spacing: 0.05em;
+                min-width: 80px;
+                color: #555;
+                flex-shrink: 0;
+            }}
+            .utterance-text {{
                 color: #333;
+                font-size: 14px;
             }}
             .back {{
                 display: inline-block;
@@ -1144,7 +1244,12 @@ async def view_call(call_sid: str):
             
             <div class="section">
                 <h2>📄 Full Transcript</h2>
-                <div class="transcript">{transcript or 'Transcript not available yet'}</div>
+                <div class="transcript">{''.join(
+                    f'<div class="utterance {"rep" if line.startswith("Rep:") else "practice"}">' +
+                    f'<span class="speaker-label">{"🎤 Rep" if line.startswith("Rep:") else "🏥 Practice"}</span>' +
+                    f'<span class="utterance-text">{line[line.index(":")+1:].strip()}</span></div>'
+                    for line in (transcript or "").split("\n") if line.strip()
+                ) or "<p style=\'color:#999;\'>Transcript not available yet</p>"}</div>
             </div>
         </div>
     </body>
