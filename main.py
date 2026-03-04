@@ -724,7 +724,7 @@ def enroll_in_lgm_audience(contact_id: str, email: str, phone: str, practice_nam
     if HUBSPOT_API_KEY and contact_id:
         try:
             hs("PATCH", f"/crm/v3/objects/contacts/{contact_id}", json={"properties": {
-                "lgm_ready":             "true",
+                "lgm_ready":             "true",   # matches HubSpot enum: "true"/"false"
                 "lgm_enrolled_date":     datetime.now().strftime("%Y-%m-%d"),
                 "last_call_disposition": likelihood,
                 "practice_vertical":     practice_type,
@@ -798,8 +798,8 @@ def ensure_hubspot_custom_properties():
          ]},
         {"name": "lgm_ready",             "label": "LGM Ready",            "type": "enumeration", "fieldType": "select",
          "options": [
-             {"label": "Yes", "value": "Yes", "displayOrder": 0, "hidden": False},
-             {"label": "No",  "value": "No",  "displayOrder": 1, "hidden": False},
+             {"label": "Yes", "value": "true",  "displayOrder": 0, "hidden": False},
+             {"label": "No",  "value": "false", "displayOrder": 1, "hidden": False},
          ]},
         {"name": "practice_vertical",     "label": "Practice Vertical",    "type": "string", "fieldType": "text"},
         {"name": "last_call_disposition", "label": "Last Call Disposition", "type": "string", "fieldType": "text"},
@@ -882,9 +882,8 @@ def create_or_update_hubspot_contact(phone_number: str, practice_name: str, call
         "company":               resolved_name or "Unknown Practice",
         "lifecyclestage":        "lead",
         "hs_lead_status":        "OPEN",
-        "contact_type":          "Lead",
         "sales_lead_type":       sales_lead_type,
-        "lgm_ready":             "No",        # default NO — only flipped to Yes on LGM enrollment
+        "lgm_ready":             "false",     # default false — flipped to "true" on LGM enrollment
         "practice_vertical":     practice_type,
         "last_call_disposition": analysis.get("conversion_likelihood", ""),
         "call_summary":          analysis.get("summary", ""),
