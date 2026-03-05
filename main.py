@@ -978,7 +978,6 @@ def create_or_update_hubspot_contact(phone_number: str, practice_name: str, call
         "company":               resolved_name or "Unknown Practice",
         "lifecyclestage":        "lead",
         "hs_lead_status":        "OPEN",
-        "contact_type":          "Practice",
         "sales_lead_type":       sales_lead_type,
         "hs_pipeline":           "default",
         "lgm_ready":             "false",     # default false — flipped to "true" on LGM enrollment
