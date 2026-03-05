@@ -66,8 +66,15 @@ async def lifespan(app: FastAPI):
             ensure_hubspot_custom_properties()
         except Exception as e:
             print(f"[STARTUP] ⚠️ HubSpot connection failed: {e}")
-    
+
+    # Start background auto-send checker (fires every 60s)
+    import asyncio
+    task = asyncio.create_task(auto_send_checker())
+    print("[STARTUP] ✅ Auto-send checker running (5-min review window)")
+
     yield
+
+    task.cancel()
 
 app = FastAPI(lifespan=lifespan)
 
@@ -249,11 +256,23 @@ async def home():
                     return;
                 }
                 
-                historyDiv.innerHTML = calls.map(call => `
-                    <div class="call-card">
+                historyDiv.innerHTML = calls.map(call => {
+                    const statusColors = {
+                        'pending_review': '#e67e00',
+                        'confirmed': '#28a745',
+                        'sent': '#28a745',
+                        'discarded': '#6c757d',
+                        'completed': '#667eea',
+                        'initiated': '#aaa',
+                        'error': '#dc3545'
+                    };
+                    const statusColor = statusColors[call.status] || '#667eea';
+                    const isPending = call.status === 'pending_review';
+                    return `
+                    <div class="call-card" style="${isPending ? 'border-left:4px solid #e67e00;' : ''}">
                         <div class="call-header">
                             <span class="call-phone">${call.phone_number}</span>
-                            <span class="call-status">${call.status}</span>
+                            <span class="call-status" style="background:${statusColor}">${isPending ? '⏳ Review Now' : call.status}</span>
                         </div>
                         <div class="call-details">
                             ${call.caller_name} • ${new Date(call.created_at).toLocaleString()}
@@ -266,7 +285,8 @@ async def home():
                             </div>
                         ` : ''}
                     </div>
-                `).join('');
+                `;
+                }).join('');
             }
             
             document.getElementById('callForm').onsubmit = async (e) => {
@@ -573,46 +593,18 @@ async def recording_ready(request: Request):
             print(f"[SUPABASE] ⚠️ Storage upload failed: {e}, using Twilio URL")
             final_recording_url = full_recording_url
         
+        # Save as pending_review — dashboard shows review card, auto-sends after 5 min
+        auto_send_at = (datetime.now() + timedelta(minutes=5)).isoformat()
         supabase.table('sales_calls').update({
             "transcript": transcript,
             "analysis": analysis,
             "recording_url": final_recording_url,
-            "status": "completed",
-            "completed_at": datetime.now().isoformat()
+            "status": "pending_review",
+            "completed_at": datetime.now().isoformat(),
+            "auto_send_at": auto_send_at
         }).eq('call_sid', call_sid).execute()
         
-        print(f"[SUPABASE] ✅ Database updated for call {call_sid}")
-        
-        call_data = supabase.table('sales_calls').select("*").eq('call_sid', call_sid).execute()
-        
-        if call_data.data and len(call_data.data) > 0:
-            call_record = call_data.data[0]
-            phone_number = call_record.get('phone_number')
-            caller_name = call_record.get('caller_name')
-            practice_name = call_record.get('practice_name') or analysis.get('practice_name', 'Unknown')
-            
-            if hubspot_client and phone_number:
-                print("[HUBSPOT] Starting sync...")
-                
-                hubspot_result = create_or_update_hubspot_contact(
-                    phone_number=phone_number,
-                    practice_name=practice_name,
-                    caller_name=caller_name,
-                    analysis=analysis,
-                    call_sid=call_sid,
-                    recording_url=final_recording_url
-                )
-                
-                if hubspot_result.get("action") in ["created", "updated"]:
-                    contact_id = hubspot_result["contact_id"]
-                    add_contact_to_sales_pipeline(contact_id, analysis)
-                    add_hubspot_note(contact_id, analysis, final_recording_url, call_sid)
-                    if analysis.get("conversion_likelihood") in ["high", "medium"]:
-                        email = get_email_for_phone(phone_number)
-                        enroll_in_lgm_audience(contact_id=contact_id, email=email, phone=phone_number, practice_name=practice_name, analysis=analysis)
-                    else:
-                        print(f"[LGM] Skipping — conversion likelihood: {analysis.get('conversion_likelihood')}")
-                    print(f"[HUBSPOT] ✅ Sync complete for contact {contact_id}")
+        print(f"[REVIEW] ⏳ Call {call_sid} pending review — auto-sends at {auto_send_at}")
         
     except Exception as e:
         print(f"[RECORDING-READY ERROR] {str(e)}")
@@ -625,6 +617,89 @@ async def recording_ready(request: Request):
             pass
     
     return {"status": "processed"}
+
+def push_to_hubspot_lgm(call_sid: str, analysis_override: dict = None):
+    """
+    Shared by: confirm endpoint (manual) + auto-send background task (5 min timeout).
+    Accepts an optional analysis_override so edited fields from the review card are used.
+    """
+    try:
+        call_data = supabase.table('sales_calls').select("*").eq('call_sid', call_sid).execute()
+        if not call_data.data:
+            print(f"[PUSH] Call {call_sid} not found")
+            return
+
+        call_record = call_data.data[0]
+        # Don't double-send if already confirmed or sent
+        if call_record.get('status') in ("confirmed", "sent", "error"):
+            print(f"[PUSH] Skipping {call_sid} — already {call_record.get('status')}")
+            return
+
+        phone_number  = call_record.get('phone_number')
+        caller_name   = call_record.get('caller_name')
+        practice_name = call_record.get('practice_name')
+        final_recording_url = call_record.get('recording_url', '')
+
+        # Use override if provided (edited from review card), else use stored analysis
+        raw_analysis = call_record.get('analysis') or {}
+        analysis = analysis_override if analysis_override else (
+            raw_analysis if isinstance(raw_analysis, dict) else json.loads(raw_analysis or '{}')
+        )
+
+        # Mark as confirmed immediately to prevent double-send race
+        supabase.table('sales_calls').update({"status": "confirmed"}).eq('call_sid', call_sid).execute()
+
+        practice_name = practice_name or analysis.get('practice_name', 'Unknown')
+
+        if hubspot_client and phone_number:
+            print(f"[PUSH] Starting HubSpot sync for {call_sid}...")
+            hubspot_result = create_or_update_hubspot_contact(
+                phone_number=phone_number,
+                practice_name=practice_name,
+                caller_name=caller_name,
+                analysis=analysis,
+                call_sid=call_sid,
+                recording_url=final_recording_url
+            )
+
+            if hubspot_result.get("action") in ["created", "updated"]:
+                contact_id = hubspot_result["contact_id"]
+                add_contact_to_sales_pipeline(contact_id, analysis)
+                add_hubspot_note(contact_id, analysis, final_recording_url, call_sid)
+                if analysis.get("conversion_likelihood") != "none":
+                    email = get_email_for_phone(phone_number)
+                    enroll_in_lgm_audience(
+                        contact_id=contact_id, email=email,
+                        phone=phone_number, practice_name=practice_name, analysis=analysis
+                    )
+                else:
+                    print(f"[PUSH] Skipping LGM — explicit hard NO")
+                print(f"[PUSH] ✅ Complete for contact {contact_id}")
+
+        supabase.table('sales_calls').update({"status": "sent"}).eq('call_sid', call_sid).execute()
+
+    except Exception as e:
+        print(f"[PUSH ERROR] {call_sid}: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+async def auto_send_checker():
+    """Background task — runs every 60s, auto-sends any pending_review calls past their 5-min window."""
+    import asyncio
+    while True:
+        await asyncio.sleep(60)
+        try:
+            now = datetime.now().isoformat()
+            result = supabase.table('sales_calls').select("call_sid, auto_send_at").eq(
+                'status', 'pending_review'
+            ).lte('auto_send_at', now).execute()
+            for row in (result.data or []):
+                print(f"[AUTO-SEND] ⏰ Auto-sending {row['call_sid']} (review window expired)")
+                push_to_hubspot_lgm(row['call_sid'])
+        except Exception as e:
+            print(f"[AUTO-SEND ERROR] {e}")
+
 
 def analyze_sales_call(transcript: str) -> dict:
     prompt = f"""You are analyzing a B2B outbound sales call for Opus Health — a healthcare payments platform that automates HSA/FSA billing for dental practices, med spas, and weight loss clinics.
@@ -651,7 +726,7 @@ Return ONLY a valid JSON object with these exact fields:
   "callback_name": "name of person to call back if mentioned, or null",
   "callback_extension": "phone extension if mentioned, or null",
   "email_mentioned": "email address spoken in the call if any, or null",
-  "conversion_likelihood": "high | medium | low | none",
+  "conversion_likelihood": "high (very interested, asked for pricing/demo/next steps) | medium (open, asked to email or call back, wants to discuss with manager) | low (soft brush-off: busy, in meeting, office manager unavailable, asked to send email — did NOT say no) | none (explicit hard NO only: said not interested, told us to stop calling, already happy with current solution, asked to be removed)",
   "key_quotes": ["1-3 direct quotes from the practice side only"],
   "summary": "2-3 sentences covering what happened, who was spoken to, and what was agreed"
 }}"""
@@ -694,11 +769,11 @@ Return ONLY a valid JSON object with these exact fields:
 
 def get_email_for_phone(phone_number: str) -> str:
     """
-    Look up the email we verified during lead generation from Supabase pending_leads.
-    Falls back to empty string if not found.
+    Look up email for this phone number.
+    1. Check Supabase pending_leads (leads from Apify cron)
+    2. Fallback: check HubSpot (covers manually-imported contacts like EQ Dental, Bear Creek)
     """
     try:
-        # Normalize phone for lookup
         digits = ''.join(c for c in phone_number if c.isdigit())
         result = supabase.table("pending_leads").select("email, email_valid").or_(
             f"phone.eq.{phone_number},phone.eq.+{digits},phone.eq.+1{digits[-10:]}"
@@ -707,6 +782,22 @@ def get_email_for_phone(phone_number: str) -> str:
             return result.data[0]["email"]
     except Exception as e:
         print(f"[SUPABASE] Could not fetch email for {phone_number}: {e}")
+
+    # Fallback: check HubSpot for contacts imported manually
+    if HUBSPOT_API_KEY:
+        try:
+            search = hs("POST", "/crm/v3/objects/contacts/search", json={
+                "filterGroups": [{"filters": [{"propertyName": "phone", "operator": "EQ", "value": phone_number}]}],
+                "properties": ["email"]
+            })
+            results = search.get("results", [])
+            if results and results[0].get("properties", {}).get("email"):
+                email = results[0]["properties"]["email"]
+                print(f"[HUBSPOT] Found email via fallback lookup: {email}")
+                return email
+        except Exception as e:
+            print(f"[HUBSPOT] Email fallback lookup failed for {phone_number}: {e}")
+
     return ""
 
 
@@ -740,10 +831,13 @@ def enroll_in_lgm_audience(contact_id: str, email: str, phone: str, practice_nam
         print("[LGM] Skipping LGM push - LGM_API_KEY or LGM_AUDIENCE_ID not set")
         return
 
-    # Build firstname: use real contact name from call if available,
-    # fall back to practice name so {{firstname}} is never blank in sequences
+    # Build firstname: first word of contact name (e.g. "Hope" not "Hope Smith")
+    # Fall back to practice name if no contact extracted, "there" as last resort
     contact_name = analysis.get("contact_name") or ""
-    lgm_firstname = contact_name if contact_name and contact_name.lower() not in ("null", "unknown", "") else (practice_name or "there")
+    if contact_name and contact_name.lower() not in ("null", "unknown", ""):
+        lgm_firstname = contact_name.split()[0]  # first name only
+    else:
+        lgm_firstname = practice_name or "there"
     lgm_lastname  = ""  # always blank — avoids "Hi Practice," in sequences
 
     lgm_payload = {
@@ -754,7 +848,7 @@ def enroll_in_lgm_audience(contact_id: str, email: str, phone: str, practice_nam
         "companyName": practice_name or "Unknown Practice",
     }
     if email and "@" in email:
-        lgm_payload["email"] = email
+        lgm_payload["proEmail"] = email  # LGM API field: proEmail (confirmed from CSV export)
 
     print(f"[LGM] Payload: {lgm_payload}")
 
@@ -781,6 +875,12 @@ def ensure_hubspot_custom_properties():
     Safe to call on every deploy — HubSpot ignores duplicates (409 = already exists).
     """
     custom_props = [
+        {"name": "contact_type", "label": "Contact Type", "type": "enumeration", "fieldType": "select",
+         "options": [
+             {"label": "Practice", "value": "Practice", "displayOrder": 0, "hidden": False},
+             {"label": "Partner",  "value": "Partner",  "displayOrder": 1, "hidden": False},
+             {"label": "Other",    "value": "Other",    "displayOrder": 2, "hidden": False},
+         ]},
         {"name": "sales_lead_type", "label": "Sales - Lead Type", "type": "enumeration", "fieldType": "select",
          "options": [
              {"label": "Dental Practice",    "value": "Dental Practice",    "displayOrder": 0, "hidden": False},
@@ -845,8 +945,11 @@ def create_or_update_hubspot_contact(phone_number: str, practice_name: str, call
     # If we have a real person's name from the call, use firstname only, blank lastname
     # If no contact name found, fall back to practice name in firstname, blank lastname
     raw_contact = analysis.get("contact_name") or ""
-    contact_first = raw_contact if raw_contact else (resolved_name or "Unknown")
-    contact_last  = ""  # Never set to "Practice" — avoids "Hi Practice," in LGM sequences
+    # Use only the first word of the contact name (e.g. "Hope" not "Hope Smith")
+    # Fall back to practice name if no contact name extracted
+    # Never set lastname — avoids "Hi Practice," or "Hi Smith," in LGM sequences
+    contact_first = raw_contact.split()[0] if raw_contact and raw_contact.lower() not in ("null", "unknown", "") else (resolved_name or "Unknown")
+    contact_last  = ""
 
     # Map practice_type to our custom property values
     practice_type = analysis.get("practice_type", "other")
@@ -874,7 +977,9 @@ def create_or_update_hubspot_contact(phone_number: str, practice_name: str, call
         "company":               resolved_name or "Unknown Practice",
         "lifecyclestage":        "lead",
         "hs_lead_status":        "OPEN",
+        "contact_type":          "Practice",
         "sales_lead_type":       sales_lead_type,
+        "hs_pipeline":           "default",
         "lgm_ready":             "false",     # default false — flipped to "true" on LGM enrollment
         "practice_vertical":     practice_type,
         "last_call_disposition": analysis.get("conversion_likelihood", ""),
@@ -1087,186 +1192,270 @@ async def export_csv():
         print(f"[CSV EXPORT ERROR] {e}")
         return {"error": str(e)}
 
+@app.post("/call/{call_sid}/confirm")
+async def confirm_call(call_sid: str, request: Request):
+    """
+    Confirm review and push to HubSpot + LGM.
+    Accepts optional edited fields in request body — any field sent overrides AI analysis.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    # If edited fields were sent, merge them into the stored analysis
+    analysis_override = None
+    if body:
+        call_data = supabase.table('sales_calls').select("analysis").eq('call_sid', call_sid).execute()
+        if call_data.data:
+            raw = call_data.data[0].get('analysis') or {}
+            stored = raw if isinstance(raw, dict) else json.loads(raw or '{}')
+            stored.update({k: v for k, v in body.items() if v is not None and v != ""})
+            analysis_override = stored
+            # Persist the edited analysis
+            supabase.table('sales_calls').update({"analysis": analysis_override}).eq('call_sid', call_sid).execute()
+
+    push_to_hubspot_lgm(call_sid, analysis_override)
+    return {"status": "confirmed", "call_sid": call_sid}
+
+
+@app.post("/call/{call_sid}/discard")
+async def discard_call(call_sid: str):
+    """Skip HubSpot + LGM for this call entirely."""
+    supabase.table('sales_calls').update({"status": "discarded"}).eq('call_sid', call_sid).execute()
+    print(f"[REVIEW] ❌ Discarded {call_sid}")
+    return {"status": "discarded", "call_sid": call_sid}
+
+
 @app.get("/call/{call_sid}", response_class=HTMLResponse)
 async def view_call(call_sid: str):
     try:
-        result = supabase.table('sales_calls').select(
-            "phone_number, caller_name, practice_name, transcript, analysis, created_at, recording_url"
-        ).eq('call_sid', call_sid).execute()
-        
-        if not result.data or len(result.data) == 0:
+        result = supabase.table('sales_calls').select("*").eq('call_sid', call_sid).execute()
+        if not result.data:
             return "<h1>Call not found</h1>"
-        
         row = result.data[0]
-        phone = row['phone_number']
-        caller = row['caller_name']
-        practice = row['practice_name']
-        transcript = row['transcript']
-        analysis = row['analysis'] if isinstance(row['analysis'], dict) else json.loads(row['analysis'] or '{}')
-        created = row['created_at']
-        recording_url = row.get('recording_url', '')
     except Exception as e:
-        print(f"[SUPABASE] ❌ Error fetching call: {e}")
-        return f"<h1>Error loading call: {e}</h1>"
-    
-    recording_link = ""
-    if recording_url:
-        recording_link = f'<p><strong>Recording:</strong> <a href="{recording_url}" download style="color: #667eea;">Download MP3</a></p>'
-    
-    return f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Call Details - {phone}</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <style>
-            body {{
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-                background: #f5f5f5;
-                padding: 20px;
-                margin: 0;
-            }}
-            .container {{
-                max-width: 900px;
-                margin: 0 auto;
-                background: white;
-                border-radius: 10px;
-                padding: 30px;
-            }}
-            h1 {{ color: #333; margin-bottom: 5px; }}
-            .meta {{ color: #666; margin-bottom: 30px; }}
-            .section {{
-                background: #f8f9fa;
-                padding: 20px;
-                border-radius: 10px;
-                margin-bottom: 20px;
-            }}
-            .section h2 {{
-                margin-top: 0;
-                color: #667eea;
-            }}
-            .badge {{
-                display: inline-block;
-                padding: 5px 10px;
-                border-radius: 5px;
-                font-size: 12px;
-                font-weight: 600;
-                margin-right: 10px;
-            }}
-            .high {{ background: #d4edda; color: #155724; }}
-            .medium {{ background: #fff3cd; color: #856404; }}
-            .low {{ background: #f8d7da; color: #721c24; }}
-            ul {{ line-height: 1.8; }}
-            .transcript {{
-                display: flex;
-                flex-direction: column;
-                gap: 8px;
-            }}
-            .utterance {{
-                display: flex;
-                align-items: baseline;
-                gap: 10px;
-                padding: 8px 12px;
-                border-radius: 8px;
-                line-height: 1.5;
-            }}
-            .utterance.rep {{
-                background: #eef2ff;
-                border-left: 3px solid #667eea;
-            }}
-            .utterance.practice {{
-                background: #f0fdf4;
-                border-left: 3px solid #43cea2;
-            }}
-            .speaker-label {{
-                font-size: 11px;
-                font-weight: 700;
-                text-transform: uppercase;
-                letter-spacing: 0.05em;
-                min-width: 80px;
-                color: #555;
-                flex-shrink: 0;
-            }}
-            .utterance-text {{
-                color: #333;
-                font-size: 14px;
-            }}
-            .back {{
-                display: inline-block;
-                margin-bottom: 20px;
-                color: #667eea;
-                text-decoration: none;
-            }}
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <a href="/" class="back">← Back to Dashboard</a>
-            <h1>Call: {phone}</h1>
-            <div class="meta">
-                By {caller} • {practice or 'Unknown Practice'} • {created}
+        return f"<h1>Error: {e}</h1>"
+
+    phone         = row.get('phone_number', '')
+    caller        = row.get('caller_name', '')
+    practice_ui   = row.get('practice_name', '')
+    transcript    = row.get('transcript', '')
+    recording_url = row.get('recording_url', '')
+    status        = row.get('status', '')
+    auto_send_at  = row.get('auto_send_at', '')
+    raw_analysis  = row.get('analysis') or {}
+    analysis      = raw_analysis if isinstance(raw_analysis, dict) else json.loads(raw_analysis or '{}')
+
+    # ── HubSpot field population preview ────────────────────────────────────
+    raw_contact   = analysis.get('contact_name') or ''
+    firstname     = raw_contact.split()[0] if raw_contact and raw_contact.lower() not in ('null','unknown','') else (analysis.get('practice_name') or practice_ui or '')
+    practice_type = analysis.get('practice_type', 'other')
+    lead_type_map = {'dental':'Dental Practice','medspa':'Med Spa','weight_loss':'Weight Loss Clinic','other':'Other'}
+    sales_lead_type = lead_type_map.get(practice_type, 'Dental Practice')
+    email_val     = analysis.get('email_mentioned') or ''
+    likelihood    = analysis.get('conversion_likelihood', '')
+    next_steps    = analysis.get('next_steps') or ''
+    if isinstance(next_steps, list):
+        next_steps = '; '.join(next_steps)
+    summary       = analysis.get('summary', '')
+    contact_title = analysis.get('contact_title') or ''
+    callback_name = analysis.get('callback_name') or ''
+
+    def field_row(label, value, editable_key=None, warn=False):
+        if value:
+            badge   = '<span class="badge ok">✓ Will populate</span>'
+            display = f'<span class="fval">{value}</span>'
+        else:
+            badge   = '<span class="badge miss">✗ Missing</span>'
+            display = '<span class="fval empty">—</span>'
+        edit = f'<input class="edit-input" data-key="{editable_key}" placeholder="Edit…" value="{value or ""}">' if editable_key else ''
+        warn_icon = ' ⚠️' if warn and not value else ''
+        return f'<tr><td class="flabel">{label}{warn_icon}</td><td>{badge}</td><td>{display}{edit}</td></tr>'
+
+    hs_rows = (
+        field_row('First Name',         firstname,                          'contact_name')   +
+        field_row('Practice Name',      analysis.get('practice_name') or practice_ui, 'practice_name') +
+        field_row('Phone',              phone)                                                +
+        field_row('Email',              email_val,                          'email_mentioned', warn=True) +
+        field_row('Contact Title',      contact_title,                      'contact_title')  +
+        field_row('Sales - Lead Type',  sales_lead_type)                                      +
+        field_row('Contact Type',       'Practice')                                           +
+        field_row('Pipeline',           'Sales (default)')                                    +
+        field_row('Conversion',         likelihood)                                           +
+        field_row('Next Steps',         next_steps,                         'next_steps')     +
+        field_row('Summary',            (summary[:80] + '…') if len(summary) > 80 else summary, 'summary') +
+        field_row('Callback Name',      callback_name,                      'callback_name')
+    )
+
+    lgm_will_run = likelihood != 'none'
+    lgm_status   = '✅ Will enroll in LGM campaign' if lgm_will_run else '⛔ Will NOT enroll — explicit hard NO'
+    lgm_color    = '#d4edda' if lgm_will_run else '#f8d7da'
+
+    countdown_js = f'const autoSendAt = new Date("{auto_send_at}");' if (status == 'pending_review' and auto_send_at) else ''
+
+    recording_html = f'<a href="{recording_url}" style="color:#667eea">⬇ Download MP3</a>' if recording_url else '—'
+
+    transcript_html = ''
+    for line in (transcript or '').split('\n'):
+        line = line.strip()
+        if not line:
+            continue
+        is_rep = line.startswith('Rep:')
+        cls    = 'rep' if is_rep else 'practice'
+        label  = '🎤 Rep' if is_rep else '🏥 Practice'
+        text   = line[line.index(':')+1:].strip()
+        transcript_html += f'<div class="utt {cls}"><span class="sp">{label}</span><span class="ut">{text}</span></div>'
+
+    if status == 'pending_review':
+        bar_bg  = '#e67e00'
+        bar_content = f'''
+            <div>
+                <strong>⏳ Pending Review</strong>
+                <span id="countdown" style="margin-left:12px;font-size:13px;opacity:.85"></span>
+                <span style="font-size:12px;opacity:.7;margin-left:8px">— auto-sends if not reviewed</span>
             </div>
-            
-            {recording_link}
-            
-            <div class="section">
-                <h2>📊 AI Analysis</h2>
-                <p><strong>Practice:</strong> {analysis.get('practice_name', 'Unknown')}</p>
-                <p><strong>Type:</strong> {analysis.get('practice_type', 'Unknown')}</p>
-                <p><strong>Conversion Likelihood:</strong> 
-                    <span class="badge {analysis.get('conversion_likelihood', 'low')}">
-                        {analysis.get('conversion_likelihood', 'Unknown').upper()}
-                    </span>
-                </p>
-                <p><strong>Summary:</strong> {analysis.get('summary', 'No summary available')}</p>
-            </div>
-            
-            <div class="section">
-                <h2>💬 Key Quotes</h2>
-                <ul>
-                    {''.join(f'<li>{quote}</li>' for quote in analysis.get('key_quotes', []))}
-                </ul>
-            </div>
-            
-            <div class="section">
-                <h2>😣 Pain Points</h2>
-                <ul>
-                    {''.join(f'<li>{pain}</li>' for pain in analysis.get('pain_points', []))}
-                </ul>
-            </div>
-            
-            <div class="section">
-                <h2>🚫 Objections</h2>
-                <ul>
-                    {''.join(f'<li>{obj}</li>' for obj in analysis.get('objections', []))}
-                </ul>
-            </div>
-            
-            <div class="section">
-                <h2>✅ Value Props That Resonated</h2>
-                <ul>
-                    {''.join(f'<li>{vp}</li>' for vp in analysis.get('value_props_resonated', []))}
-                </ul>
-            </div>
-            
-            <div class="section">
-                <h2>📝 Next Steps</h2>
-                <p>{analysis.get('next_steps', 'None specified')}</p>
-            </div>
-            
-            <div class="section">
-                <h2>📄 Full Transcript</h2>
-                <div class="transcript">{''.join(
-                    f'<div class="utterance {"rep" if line.startswith("Rep:") else "practice"}">' +
-                    f'<span class="speaker-label">{"🎤 Rep" if line.startswith("Rep:") else "🏥 Practice"}</span>' +
-                    f'<span class="utterance-text">{line[line.index(":")+1:].strip()}</span></div>'
-                    for line in (transcript or "").split("\n") if line.strip()
-                ) or "<p style=\'color:#999;\'>Transcript not available yet</p>"}</div>
-            </div>
+            <div class="review-actions">
+                <button class="btn-discard" onclick="doDiscard()">❌ Discard</button>
+                <button class="btn-confirm" onclick="doConfirm()">✅ Confirm &amp; Send</button>
+            </div>'''
+    elif status in ('confirmed', 'sent'):
+        bar_bg  = '#28a745'
+        bar_content = '<strong>✅ Sent to HubSpot &amp; LGM</strong>'
+    elif status == 'discarded':
+        bar_bg  = '#6c757d'
+        bar_content = '<strong>❌ Discarded — not sent</strong>'
+    else:
+        bar_bg  = '#555'
+        bar_content = f'<strong>Status: {status}</strong>'
+
+    pain_html = '<br>'.join('• ' + p for p in (analysis.get('pain_points') or [])) or '—'
+    obj_html  = '<br>'.join('• ' + o for o in (analysis.get('objections')   or [])) or '—'
+    conv_cls  = 'ok' if likelihood in ('high','medium') else 'miss'
+
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+    <title>Review — {practice_ui or phone}</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <style>
+        *{{box-sizing:border-box;margin:0;padding:0}}
+        body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f0f2f5;min-height:100vh}}
+        #review-bar{{position:sticky;top:0;z-index:100;background:{bar_bg};color:white;padding:14px 24px;box-shadow:0 2px 8px rgba(0,0,0,.2)}}
+        .review-inner{{max-width:1020px;margin:0 auto;display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}}
+        .review-actions{{display:flex;gap:10px}}
+        .btn-confirm{{background:white;color:#28a745;border:none;padding:10px 22px;border-radius:8px;font-weight:700;font-size:14px;cursor:pointer}}
+        .btn-discard{{background:rgba(255,255,255,.2);color:white;border:1px solid rgba(255,255,255,.5);padding:10px 18px;border-radius:8px;font-size:14px;cursor:pointer}}
+        .wrap{{max-width:1020px;margin:0 auto;padding:24px 16px}}
+        .back{{color:#667eea;text-decoration:none;font-size:14px;display:inline-block;margin-bottom:16px}}
+        h1{{color:#1a1a2e;font-size:22px;margin-bottom:4px}}
+        .meta{{color:#666;font-size:13px;margin-bottom:20px}}
+        .grid{{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px}}
+        @media(max-width:700px){{.grid{{grid-template-columns:1fr}}}}
+        .card{{background:white;border-radius:12px;padding:20px;box-shadow:0 1px 4px rgba(0,0,0,.08)}}
+        .card h2{{font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:#888;margin-bottom:14px}}
+        table{{width:100%;border-collapse:collapse}}
+        .flabel{{font-size:13px;color:#444;padding:7px 8px 7px 0;width:38%;vertical-align:top;font-weight:500}}
+        .fval{{font-size:13px;color:#1a1a2e}}
+        .fval.empty{{color:#bbb}}
+        .badge{{font-size:11px;font-weight:600;padding:2px 8px;border-radius:20px;white-space:nowrap;margin-right:6px}}
+        .badge.ok{{background:#d4edda;color:#155724}}
+        .badge.miss{{background:#f8d7da;color:#721c24}}
+        .edit-input{{border:1.5px solid #667eea;border-radius:6px;padding:5px 8px;font-size:12px;width:100%;margin-top:5px;display:none;outline:none}}
+        .edit-input.active{{display:block}}
+        .lgm-box{{padding:12px 16px;border-radius:8px;font-size:13px;font-weight:600;background:{lgm_color};margin-top:14px}}
+        .edit-hint{{font-size:11px;color:#aaa;margin-top:8px}}
+        .utt{{display:flex;gap:10px;padding:8px 12px;border-radius:8px;margin-bottom:5px;align-items:baseline}}
+        .utt.rep{{background:#eef2ff;border-left:3px solid #667eea}}
+        .utt.practice{{background:#f0fdf4;border-left:3px solid #43cea2}}
+        .sp{{font-size:11px;font-weight:700;text-transform:uppercase;min-width:76px;color:#555;flex-shrink:0}}
+        .ut{{font-size:13px;color:#333;line-height:1.5}}
+        #toast{{position:fixed;bottom:24px;right:24px;background:#333;color:white;padding:12px 20px;border-radius:8px;font-size:13px;display:none;z-index:999;box-shadow:0 4px 12px rgba(0,0,0,.2)}}
+    </style>
+</head>
+<body>
+<div id="review-bar"><div class="review-inner">{bar_content}</div></div>
+<div class="wrap">
+    <a href="/" class="back">← Dashboard</a>
+    <h1>{practice_ui or analysis.get('practice_name') or phone}</h1>
+    <div class="meta">Called by {caller} &nbsp;·&nbsp; {phone} &nbsp;·&nbsp; {str(row.get('created_at',''))[:16]} &nbsp;·&nbsp; {recording_html}</div>
+
+    <div class="grid">
+        <div class="card" style="grid-column:1/-1">
+            <h2>📋 HubSpot Fields — click any editable field to fix before sending</h2>
+            <table>{hs_rows}</table>
+            <div class="lgm-box">{lgm_status}</div>
+            <p class="edit-hint">Fields marked ⚠️ are important but missing. Click a value to edit inline.</p>
         </div>
-    </body>
-    </html>
-    """
+
+        <div class="card">
+            <h2>🤖 AI Analysis</h2>
+            <table>
+                <tr><td class="flabel">Practice Type</td><td class="fval">{practice_type.title()}</td></tr>
+                <tr><td class="flabel">Conversion</td><td><span class="badge {conv_cls}">{likelihood.upper() if likelihood else '—'}</span></td></tr>
+                <tr><td class="flabel">Summary</td><td class="fval" style="font-size:12px;line-height:1.5">{summary or '—'}</td></tr>
+                <tr><td class="flabel">Pain Points</td><td class="fval" style="font-size:12px">{pain_html}</td></tr>
+                <tr><td class="flabel">Objections</td><td class="fval" style="font-size:12px">{obj_html}</td></tr>
+                <tr><td class="flabel">Next Steps</td><td class="fval" style="font-size:12px">{next_steps or '—'}</td></tr>
+            </table>
+        </div>
+
+        <div class="card">
+            <h2>📄 Transcript</h2>
+            {transcript_html or '<span style="color:#bbb;font-size:13px">Not available yet</span>'}
+        </div>
+    </div>
+</div>
+<div id="toast"></div>
+<script>
+{countdown_js}
+if (typeof autoSendAt !== 'undefined') {{
+    function tick() {{
+        const diff = Math.max(0, Math.round((autoSendAt - new Date()) / 1000));
+        const el = document.getElementById('countdown');
+        if (!el) return;
+        if (diff <= 0) {{ el.textContent = 'Auto-sending now…'; setTimeout(() => location.reload(), 3000); return; }}
+        const m = Math.floor(diff/60), s = diff%60;
+        el.textContent = 'Auto-sends in ' + m + ':' + s.toString().padStart(2,'0');
+    }}
+    tick(); setInterval(tick, 1000);
+}}
+document.querySelectorAll('.fval').forEach(el => {{
+    const inp = el.nextElementSibling;
+    if (inp && inp.classList.contains('edit-input')) {{
+        el.style.cursor = 'pointer';
+        el.title = 'Click to edit';
+        el.addEventListener('click', () => inp.classList.toggle('active'));
+    }}
+}});
+function toast(msg) {{
+    const t = document.getElementById('toast');
+    t.textContent = msg; t.style.display = 'block';
+    setTimeout(() => t.style.display='none', 3000);
+}}
+function getEdits() {{
+    const e = {{}};
+    document.querySelectorAll('.edit-input').forEach(i => {{ if(i.value.trim()) e[i.dataset.key]=i.value.trim(); }});
+    return e;
+}}
+async function doConfirm() {{
+    const btn = document.querySelector('.btn-confirm');
+    if (btn) btn.disabled = true;
+    toast('Sending…');
+    const r = await fetch('/call/{call_sid}/confirm', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify(getEdits())}});
+    if (r.ok) {{ toast('✅ Sent to HubSpot & LGM!'); setTimeout(() => location.reload(), 1500); }}
+    else {{ toast('❌ Error — check Render logs'); if(btn) btn.disabled=false; }}
+}}
+async function doDiscard() {{
+    if (!window.confirm('Discard this call? It will NOT be sent to HubSpot or LGM.')) return;
+    await fetch('/call/{call_sid}/discard', {{method:'POST'}});
+    toast('Discarded'); setTimeout(() => location.reload(), 1500);
+}}
+</script>
+</body>
+</html>"""
+
+
 
 @app.post("/test/hubspot-lgm")
 async def test_hubspot_lgm():
