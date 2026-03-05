@@ -667,9 +667,10 @@ def push_to_hubspot_lgm(call_sid: str, analysis_override: dict = None):
                 add_contact_to_sales_pipeline(contact_id, analysis)
                 add_hubspot_note(contact_id, analysis, final_recording_url, call_sid)
                 if analysis.get("conversion_likelihood") != "none":
-                    email = get_email_for_phone(phone_number)
+                    # Use email already resolved during HubSpot sync — avoids phone format lookup failures
+                    resolved_email = hubspot_result.get("email") or get_email_for_phone(phone_number)
                     enroll_in_lgm_audience(
-                        contact_id=contact_id, email=email,
+                        contact_id=contact_id, email=resolved_email,
                         phone=phone_number, practice_name=practice_name, analysis=analysis
                     )
                 else:
@@ -1010,12 +1011,12 @@ def create_or_update_hubspot_contact(phone_number: str, practice_name: str, call
             contact_id = results[0]["id"]
             hs("PATCH", f"/crm/v3/objects/contacts/{contact_id}", json={"properties": properties})
             print(f"[HUBSPOT] ✅ Updated contact {contact_id}")
-            return {"action": "updated", "contact_id": contact_id}
+            return {"action": "updated", "contact_id": contact_id, "email": email or ""}
         else:
             created = hs("POST", "/crm/v3/objects/contacts", json={"properties": properties})
             contact_id = created["id"]
             print(f"[HUBSPOT] ✅ Created contact {contact_id}")
-            return {"action": "created", "contact_id": contact_id}
+            return {"action": "created", "contact_id": contact_id, "email": email or ""}
 
     except Exception as e:
         err_msg = str(e)
